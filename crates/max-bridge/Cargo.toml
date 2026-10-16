@@ -1,0 +1,15 @@
+[package]
+name = "max-bridge"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+axum = "0.7"
+max-client = { path = "../max-client" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+symphonia = { version = "0.5", default-features = false, features = ["ogg"] }
+symphonia-adapter-libopus = "0.2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }

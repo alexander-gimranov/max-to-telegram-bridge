@@ -1,0 +1,27 @@
+[package]
+name = "max-client"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+aes = "0.8"
+base64 = "0.22"
+cbc = "0.1"
+futures-util = "0.3"
+lz4_flex = "0.11"
+pbkdf2 = "0.12"
+rmpv = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+thiserror = "1"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = "0.26"
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
+webpki-roots = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

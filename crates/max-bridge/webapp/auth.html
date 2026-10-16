@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="{{lang}}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{title}}</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: sans-serif;
+      background: #10141c;
+      color: #f4f7fb;
+    }
+    main {
+      max-width: 24rem;
+      margin: 3rem auto;
+      padding: 0 1rem;
+    }
+    h1 {
+      font-size: 1.4rem;
+      font-weight: 600;
+    }
+    form {
+      display: grid;
+      gap: 0.75rem;
+    }
+    label {
+      font-size: 0.9rem;
+    }
+    input {
+      font: inherit;
+      padding: 0.6rem 0.7rem;
+      border: 1px solid #3d4b63;
+      border-radius: 0.4rem;
+      background: #1b2330;
+      color: inherit;
+    }
+    button {
+      font: inherit;
+      padding: 0.65rem 0.8rem;
+      border: 0;
+      border-radius: 0.4rem;
+      background: #3d7eff;
+      color: white;
+    }
+    button:disabled {
+      opacity: 0.6;
+    }
+    #status {
+      min-height: 1.4rem;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{{title}}</h1>
+    <p id="status" role="status"></p>
+    <section id="phone">
+      <form id="phone-form">
+        <label for="phone-input">{{phone_label}}</label>
+        <input id="phone-input" name="phone" autocomplete="tel" required>
+        <button type="submit">{{next}}</button>
+      </form>
+    </section>
+    <section id="code" hidden>
+      <form id="code-form">
+        <label for="code-input">{{code_label}}</label>
+        <input id="code-input" name="code" inputmode="numeric" autocomplete="one-time-code" required>
+        <button type="submit">{{next}}</button>
+      </form>
+    </section>
+    <section id="password" hidden>
+      <form id="password-form">
+        <label for="password-input">{{password_label}}</label>
+        <input id="password-input" name="password" type="password" autocomplete="current-password" required>
+        <button type="submit">{{sign_in}}</button>
+      </form>
+    </section>
+  </main>
+  <script>
+    const status = document.getElementById("status");
+    const phone = document.getElementById("phone");
+    const code = document.getElementById("code");
+    const password = document.getElementById("password");
+
+    function show(step) {
+      phone.hidden = step !== "phone";
+      code.hidden = step !== "code";
+      password.hidden = step !== "password";
+      if (step === "done") {
+        phone.hidden = true;
+        code.hidden = true;
+        password.hidden = true;
+      }
+    }
+
+    async function send(path, body, form) {
+      const button = form.querySelector("button");
+      button.disabled = true;
+      status.textContent = "";
+      try {
+        const response = await fetch(path, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const payload = await response.json();
+        status.textContent = payload.message || "";
+        show(payload.step || "phone");
+      } catch (err) {
+        status.textContent = "{{page_error}}";
+        show("phone");
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    document.getElementById("phone-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const input = document.getElementById("phone-input");
+      send("/auth/phone", { phone: input.value }, event.target);
+    });
+    document.getElementById("code-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const input = document.getElementById("code-input");
+      send("/auth/code", { code: input.value }, event.target);
+    });
+    document.getElementById("password-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const input = document.getElementById("password-input");
+      send("/auth/password", { password: input.value }, event.target);
+    });
+  </script>
+</body>
+</html>
