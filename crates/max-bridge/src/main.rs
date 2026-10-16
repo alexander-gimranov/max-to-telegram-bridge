@@ -849,13 +849,7 @@ async fn forward_max(
     let face = client.chat_face(chat_id).await;
     let own = history && me.is_some_and(|id| message.sender == Some(id));
     let forward_name = forward_author(client, message).await;
-    let bold_prefix = header_prefix(
-        forward_name.as_deref(),
-        own,
-        face.group,
-        chat_id,
-        &sender,
-    );
+    let bold_prefix = header_prefix(forward_name.as_deref(), own, face.group, chat_id, &sender);
     let title = if chat_id == 0 {
         text::FAVORITES.to_owned()
     } else {
@@ -1864,7 +1858,7 @@ fn named_rich(prefix: &str, text: &str) -> Option<Value> {
     } else {
         text.strip_prefix(&format!("{prefix}\n\n"))?
     };
-    let name = json!({"type": "marked", "text": {"type": "bold", "text": prefix}});
+    let name = json!({"type": "bold", "text": prefix});
     let pad = clock_pad(if body.is_empty() {
         prefix
     } else {
@@ -2225,6 +2219,38 @@ async fn wipe_bot_chat(
     eprintln!("bridge: cleared topics and bot history");
 }
 
+async fn wipe_topic(
+    config: &Config,
+    http: &Http,
+    client: &mut Client,
+    links: &mut Links,
+    topics: &mut HashMap<String, Topic>,
+    seen: &mut HashMap<i64, Cursor>,
+    tg_user: i64,
+    chat_id: i64,
+) -> Result<(), String> {
+    let key = topic_key(tg_user, chat_id);
+    if let Some(topic) = topics.remove(&key) {
+        if let Err(err) = delete_topic(http, config, tg_user, topic.thread_id).await {
+            topics.insert(key, topic);
+            save_topics(&config.topics_path, topics);
+            return Err(err);
+        }
+        save_topics(&config.topics_path, topics);
+    }
+    match read_chat_history(client, chat_id).await {
+        Ok(history) => {
+            drop_chat_links(links, &history);
+            save_links(&config.links_path, links);
+        }
+        Err(err) => eprintln!("bridge: history links kept for chat {chat_id}: {err}"),
+    }
+    seen.remove(&chat_id);
+    save_seen(&config.seen_path, seen);
+    eprintln!("bridge: cleared topic for chat {chat_id}");
+    Ok(())
+}
+
 async fn delete_topic(
     http: &Http,
     config: &Config,
@@ -2347,6 +2373,14 @@ async fn load_topic_history(
     Ok(())
 }
 
+fn history_chat_for_thread(
+    topics: &HashMap<String, Topic>,
+    tg_user: i64,
+    thread_id: Option<i64>,
+) -> Option<i64> {
+    topic_chat(topics, tg_user, thread_id?)
+}
+
 fn history_chat_ids(
     known: &[i64],
     seen: &HashMap<i64, Cursor>,
@@ -2411,6 +2445,23 @@ async fn load_all_history(
     Ok(())
 }
 
+async fn post_status(
+    http: &Http,
+    config: &Config,
+    tg_user: i64,
+    thread_id: Option<i64>,
+    text: &str,
+) {
+    let mut body = json!({
+        "chat_id": tg_user,
+        "text": text,
+    });
+    if let Some(thread_id) = thread_id {
+        body["message_thread_id"] = json!(thread_id);
+    }
+    let _ = telegram(http, &config.token, "sendMessage", body).await;
+}
+
 async fn run_history(
     config: &Config,
     http: &mut Http,
@@ -2422,6 +2473,7 @@ async fn run_history(
     me: Option<i64>,
     tg_user: i64,
     status_thread: Option<i64>,
+    reread: bool,
 ) -> Result<(), String> {
     if config.mode != Mode::Thread {
         let _ = telegram(
@@ -2436,23 +2488,56 @@ async fn run_history(
         .await;
         return Ok(());
     }
-    let mut note = json!({
-        "chat_id": tg_user,
-        "text": text::HISTORY_LOADING,
-    });
-    if let Some(thread_id) = status_thread {
-        note["message_thread_id"] = json!(thread_id);
+    let chat_id = history_chat_for_thread(topics, tg_user, status_thread);
+    if reread {
+        if let Some(chat_id) = chat_id {
+            if let Err(err) =
+                wipe_topic(config, http, client, links, topics, seen, tg_user, chat_id).await
+            {
+                eprintln!("bridge: topic reread failed for chat {chat_id}: {err}");
+                return Ok(());
+            }
+        } else {
+            wipe_bot_chat(config, http, map, links, topics, tg_user).await;
+        }
     }
-    let _ = telegram(http, &config.token, "sendMessage", note).await;
+    if let Some(chat_id) = chat_id {
+        let fresh = reread || !topics.contains_key(&topic_key(tg_user, chat_id));
+        if let Err(err) = open_history_topic(config, http, client, topics, tg_user, chat_id).await {
+            eprintln!("bridge: history topic failed for chat {chat_id}: {err}");
+            return Ok(());
+        }
+        let thread_id = if reread {
+            topics
+                .get(&topic_key(tg_user, chat_id))
+                .map(|topic| topic.thread_id)
+        } else {
+            status_thread
+        };
+        let loading = if reread {
+            text::HISTORY_REREAD_TOPIC
+        } else {
+            text::HISTORY_LOADING_TOPIC
+        };
+        let done = if reread {
+            text::HISTORY_REREAD_DONE_TOPIC
+        } else {
+            text::HISTORY_DONE_TOPIC
+        };
+        post_status(http, config, tg_user, thread_id, loading).await;
+        if let Err(err) = load_topic_history(
+            config, http, client, map, links, topics, seen, me, tg_user, chat_id, fresh,
+        )
+        .await
+        {
+            eprintln!("bridge: history load failed for chat {chat_id}: {err}");
+        }
+        post_status(http, config, tg_user, thread_id, done).await;
+        return Ok(());
+    }
+    post_status(http, config, tg_user, None, text::HISTORY_LOADING).await;
     load_all_history(config, http, client, map, links, topics, seen, me, tg_user).await?;
-    let mut done = json!({
-        "chat_id": tg_user,
-        "text": text::HISTORY_DONE,
-    });
-    if let Some(thread_id) = status_thread {
-        done["message_thread_id"] = json!(thread_id);
-    }
-    let _ = telegram(http, &config.token, "sendMessage", done).await;
+    post_status(http, config, tg_user, None, text::HISTORY_DONE).await;
     Ok(())
 }
 
@@ -2508,18 +2593,12 @@ async fn handle_update(
         let Some(active) = client.as_mut() else {
             return Ok(());
         };
-        if action == Some("reread") {
-            wipe_bot_chat(config, http, map, links, topics, user_id).await;
-        }
-        let status_thread = if action == Some("reread") {
-            None
-        } else {
-            callback.message.as_ref().and_then(|message| {
-                message
-                    .thread_id
-                    .filter(|thread| topic_chat(topics, user_id, *thread).is_some())
-            })
-        };
+        let reread = action == Some("reread");
+        let status_thread = callback.message.as_ref().and_then(|message| {
+            message
+                .thread_id
+                .filter(|thread| topic_chat(topics, user_id, *thread).is_some())
+        });
         return run_history(
             config,
             http,
@@ -2531,6 +2610,7 @@ async fn handle_update(
             *me,
             user_id,
             status_thread,
+            reread,
         )
         .await;
     }
@@ -2574,9 +2654,6 @@ async fn handle_update(
                 eprintln!("bridge: removed the history command topic");
             }
         }
-        if reread {
-            wipe_bot_chat(config, http, map, links, topics, from).await;
-        }
         return run_history(
             config,
             http,
@@ -2587,7 +2664,8 @@ async fn handle_update(
             seen,
             *me,
             from,
-            if reread { None } else { status_thread },
+            status_thread,
+            reread,
         )
         .await;
     }
@@ -3869,6 +3947,14 @@ mod tests {
             reply_to: None,
         };
         assert_eq!(stray_command_topic(&inside, &topics, 7), None);
+        assert_eq!(history_chat_for_thread(&topics, 7, Some(3)), Some(9));
+        assert_eq!(history_chat_for_thread(&topics, 7, Some(40)), None);
+        assert_eq!(history_chat_for_thread(&topics, 7, None), None);
+        assert!(is_reread_command(text::RELOAD_HISTORY));
+        assert_eq!(
+            history_chat_for_thread(&topics, 7, inside.thread_id),
+            Some(9)
+        );
     }
 
     #[test]
@@ -3912,7 +3998,7 @@ mod tests {
         let rich = named_rich("Ната К", "Ната К\n\nтекст").unwrap();
         let parts = rich["blocks"][0]["text"].as_array().unwrap();
         let expected = json!([
-            {"type": "marked", "text": {"type": "bold", "text": "Ната К"}},
+            {"type": "bold", "text": "Ната К"},
             "\n\n",
             "текст"
         ]);

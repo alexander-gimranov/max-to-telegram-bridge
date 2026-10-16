@@ -29,6 +29,10 @@ mod lang {
         "History for every contact is written into topics. Set MODE to Thread.";
     pub const HISTORY_LOADING: &str = "Loading history for every contact.";
     pub const HISTORY_DONE: &str = "History loaded.";
+    pub const HISTORY_LOADING_TOPIC: &str = "Loading history for this chat.";
+    pub const HISTORY_DONE_TOPIC: &str = "History for this chat is loaded.";
+    pub const HISTORY_REREAD_TOPIC: &str = "Reloading history for this chat.";
+    pub const HISTORY_REREAD_DONE_TOPIC: &str = "History for this chat is reloaded.";
     pub const AUTH_TITLE: &str = "Sign in to MAX";
     pub const PHONE_LABEL: &str = "Phone number";
     pub const NEXT: &str = "Next";
@@ -79,6 +83,10 @@ mod lang {
         "История всех контактов пишется в темы. Включите режим Thread.";
     pub const HISTORY_LOADING: &str = "Загружаю историю всех контактов.";
     pub const HISTORY_DONE: &str = "История загружена.";
+    pub const HISTORY_LOADING_TOPIC: &str = "Загружаю историю этого чата.";
+    pub const HISTORY_DONE_TOPIC: &str = "История этого чата загружена.";
+    pub const HISTORY_REREAD_TOPIC: &str = "Перечитываю историю этого чата.";
+    pub const HISTORY_REREAD_DONE_TOPIC: &str = "История этого чата перечитана.";
     pub const AUTH_TITLE: &str = "Вход в MAX";
     pub const PHONE_LABEL: &str = "Номер телефона";
     pub const NEXT: &str = "Дальше";
