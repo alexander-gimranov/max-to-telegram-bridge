@@ -6,7 +6,7 @@ mod models;
 mod profile;
 mod voice_tcp;
 
-pub use conn::{lookup_v4, Client, Event, PendingAuth};
+pub use conn::{beat, beat_age, lookup_v4, Client, Event, PendingAuth};
 pub use error::{Error, Result};
 pub use models::{
     Attach, ChatFace, CodeChallenge, CodeStatus, ForwardSource, Media, Message, VideoTicket,

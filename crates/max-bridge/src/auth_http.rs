@@ -16,6 +16,23 @@ use crate::text;
 pub const AUTH_URL: &str = "http://127.0.0.1:8787";
 const AUTH_HOLD: Duration = Duration::from_secs(180);
 
+async fn bind_auth() -> Result<tokio::net::TcpListener, String> {
+    let mut last = String::from("auth page failed to bind");
+    for attempt in 0..40 {
+        match tokio::net::TcpListener::bind("127.0.0.1:8787").await {
+            Ok(listener) => return Ok(listener),
+            Err(err) => {
+                last = err.to_string();
+                if attempt == 0 {
+                    eprintln!("bridge: auth page is busy; waiting");
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+    Err(last)
+}
+
 fn page_html() -> &'static str {
     static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PAGE.get_or_init(|| {
@@ -105,9 +122,7 @@ impl AuthHub {
                 hub.maintain().await;
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:8787")
-            .await
-            .map_err(|err| err.to_string())?;
+        let listener = bind_auth().await?;
         eprintln!("bridge: auth page at {AUTH_URL}");
         let app = Router::new()
             .route("/", get(page))

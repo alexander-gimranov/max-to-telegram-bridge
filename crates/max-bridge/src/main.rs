@@ -6,10 +6,14 @@ use std::env;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::net::SocketAddr;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use max_client::{lookup_v4, read_session, Attach, ChatFace, Client, Event, Media, Message};
+use max_client::{
+    beat, beat_age, lookup_v4, read_session, Attach, ChatFace, Client, Event, Media, Message,
+};
 use reqwest::multipart::{Form, Part};
 use reqwest::Client as Http;
 use serde::{Deserialize, Serialize};
@@ -17,22 +21,67 @@ use serde_json::{json, Value};
 
 const TELEGRAM_HOST: &str = "api.telegram.org";
 const MAX_MEDIA_BYTES: usize = 20 * 1024 * 1024;
+const STALL_AFTER_SECS: u64 = 180;
 
 fn main() {
-    let config = match Config::load() {
-        Ok(config) => config,
-        Err(err) => {
-            eprintln!("bridge: {err}");
-            std::process::exit(1);
+    let mut pause = Duration::from_secs(2);
+    loop {
+        let config = match Config::load() {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!("bridge: {err}");
+                std::process::exit(1);
+            }
+        };
+        match guard(config) {
+            Ok(()) => break,
+            Err(reason) => {
+                eprintln!("bridge: {reason}; restarting");
+                thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_secs(30));
+            }
         }
-    };
+    }
+}
+
+fn stalled(age: Option<u64>) -> bool {
+    age.is_some_and(|age| age > STALL_AFTER_SECS)
+}
+
+fn watch_loop(stop: std::sync::mpsc::Receiver<()>, abort: tokio::task::AbortHandle) {
+    loop {
+        match stop.recv_timeout(Duration::from_secs(5)) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if stalled(beat_age()) {
+                    abort.abort();
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn guard(config: Config) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .expect("runtime");
-    if let Err(err) = runtime.block_on(run(config)) {
-        eprintln!("bridge: {err}");
-        std::process::exit(1);
+        .map_err(|err| err.to_string())?;
+    beat();
+    let worker = runtime.spawn(run(config));
+    let abort = worker.abort_handle();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let watcher = thread::spawn(move || watch_loop(stop_rx, abort));
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| runtime.block_on(worker)));
+    drop(stop_tx);
+    let _ = watcher.join();
+    drop(runtime);
+    match outcome {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(err))) => Err(err),
+        Ok(Err(err)) if err.is_cancelled() => Err("event loop stalled".into()),
+        Ok(Err(_)) => Err("task panicked".into()),
+        Err(_) => Err("runtime panicked".into()),
     }
 }
 
@@ -481,6 +530,24 @@ async fn run(config: Config) -> Result<(), String> {
     let mut me: Option<i64> = None;
     let mut echoes = HashSet::<i64>::new();
     loop {
+        beat();
+        if client.is_none() && read_session(&config.session_path).ok().flatten().is_some() {
+            eprintln!("bridge: MAX client stopped; starting again");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            beat();
+            match Client::start(config.session_path.clone()).await {
+                Ok(started) => {
+                    client = Some(started);
+                    link = LinkState::Connecting;
+                    sync_controls(&http, &config, link, &mut panels).await;
+                }
+                Err(err) => {
+                    eprintln!("bridge: {err}");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            }
+        }
         let wake = tokio::select! {
             event = max_event(client.as_mut()) => Wake::Max(event),
             polled = poll_telegram(&http, &config.token, offset) => Wake::Telegram(polled),
@@ -714,6 +781,7 @@ async fn catch_up(
     chats.sort_unstable();
     let mut forwarded = 0usize;
     for chat_id in chats {
+        beat();
         let cursor = seen.get(&chat_id).copied();
         let mut from = unix_ms();
         let mut missed = Vec::new();
@@ -2110,6 +2178,7 @@ async fn read_chat_history(client: &Client, chat_id: i64) -> Result<Vec<Message>
     let mut all: Vec<Message> = Vec::new();
     let mut capped = true;
     for _ in 0..100 {
+        beat();
         let batch = client
             .fetch_history(chat_id, 40, from)
             .await
@@ -2331,6 +2400,7 @@ async fn load_topic_history(
     }
     let mut wrote = 0u32;
     for message in &history {
+        beat();
         if !rewrite && links.max.contains_key(&message.id) {
             continue;
         }
@@ -2862,6 +2932,7 @@ async fn telegram_http() -> Result<Http, String> {
 }
 
 async fn poll_telegram(http: &Http, token: &str, offset: i64) -> Result<Vec<Update>, String> {
+    beat();
     let url = format!("https://api.telegram.org/bot{token}/getUpdates");
     let response = http
         .get(url)
@@ -3331,6 +3402,7 @@ async fn telegram_file(
 }
 
 async fn telegram(http: &Http, token: &str, method: &str, body: Value) -> Result<Value, String> {
+    beat();
     let url = format!("https://api.telegram.org/bot{token}/{method}");
     let response = http
         .post(url)
@@ -3627,6 +3699,9 @@ mod tests {
         assert_eq!(parse_mode("").unwrap(), Mode::Chat);
         assert_eq!(parse_mode("Chat").unwrap(), Mode::Chat);
         assert_eq!(parse_mode("Thread").unwrap(), Mode::Thread);
+        assert!(!stalled(None));
+        assert!(!stalled(Some(STALL_AFTER_SECS)));
+        assert!(stalled(Some(STALL_AFTER_SECS + 1)));
         assert!(parse_mode("Forum").is_err());
     }
 

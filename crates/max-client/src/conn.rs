@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -30,7 +30,29 @@ use crate::profile::{self, Session};
 use crate::voice_tcp::VoiceLink;
 
 const QUIET_FOR: Duration = Duration::from_secs(60);
+const CMD_WAIT: Duration = Duration::from_secs(90);
 const AUTH_HOST: &str = "api2.oneme.ru";
+static BEAT: AtomicU64 = AtomicU64::new(0);
+
+pub fn beat() {
+    BEAT.store(now_secs(), Ordering::Relaxed);
+}
+
+pub fn beat_age() -> Option<u64> {
+    let beat = BEAT.load(Ordering::Relaxed);
+    if beat == 0 {
+        None
+    } else {
+        Some(now_secs().saturating_sub(beat))
+    }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
 
 #[derive(Debug)]
 pub enum Event {
@@ -112,11 +134,10 @@ impl Client {
             if let Err(err) =
                 run_forever(session, session_path, cmd_rx, event_tx.clone(), hold, cids).await
             {
-                let _ = event_tx
-                    .send(Event::Logged {
-                        note: err.to_string(),
-                    })
-                    .await;
+                let note = Event::Logged {
+                    note: err.to_string(),
+                };
+                let _ = tokio::time::timeout(Duration::from_secs(2), event_tx.send(note)).await;
             }
         });
         Ok(Client {
@@ -149,46 +170,35 @@ impl Client {
         attaches: Vec<Attach>,
     ) -> Result<Option<i64>> {
         let (reply, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(Cmd::SendText {
+        send_cmd(
+            &self.cmd_tx,
+            Cmd::SendText {
                 chat_id,
                 text: text.to_owned(),
                 reply_to,
                 attaches,
                 reply,
-            })
-            .await
-            .map_err(|_| Error::Protocol("MAX connection stopped".into()))?;
-        rx.await
-            .map_err(|_| Error::Protocol("MAX connection stopped".into()))?
+            },
+        )
+        .await?;
+        wait_cmd(rx).await?
     }
 
     pub async fn photo_upload_url(&self) -> Result<String> {
         let (reply, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(Cmd::PhotoUpload { reply })
-            .await
-            .map_err(|_| Error::Protocol("MAX connection stopped".into()))?;
-        rx.await
-            .map_err(|_| Error::Protocol("MAX connection stopped".into()))?
+        send_cmd(&self.cmd_tx, Cmd::PhotoUpload { reply }).await?;
+        wait_cmd(rx).await?
     }
 
     pub async fn voice_upload(&self) -> Result<VoiceTicket> {
         let (reply, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(Cmd::VoiceUpload { reply })
-            .await
-            .map_err(|_| Error::Protocol("MAX connection stopped".into()))?;
-        rx.await
-            .map_err(|_| Error::Protocol("MAX connection stopped".into()))?
+        send_cmd(&self.cmd_tx, Cmd::VoiceUpload { reply }).await?;
+        wait_cmd(rx).await?
     }
 
     pub async fn wait_voice(&self, audio_id: i64) -> Result<()> {
         let (reply, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(Cmd::WaitVoice { audio_id, reply })
-            .await
-            .map_err(|_| Error::Protocol("MAX connection stopped".into()))?;
+        send_cmd(&self.cmd_tx, Cmd::WaitVoice { audio_id, reply }).await?;
         match tokio::time::timeout(Duration::from_secs(12), rx).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => Err(Error::Protocol("MAX connection stopped".into())),
@@ -198,9 +208,7 @@ impl Client {
 
     pub async fn chat_title(&self, chat_id: i64) -> String {
         let (reply, rx) = oneshot::channel();
-        if self
-            .cmd_tx
-            .send(Cmd::ChatTitle { chat_id, reply })
+        if send_cmd(&self.cmd_tx, Cmd::ChatTitle { chat_id, reply })
             .await
             .is_err()
         {
@@ -214,9 +222,7 @@ impl Client {
 
     pub async fn user_name(&self, user_id: i64) -> String {
         let (reply, rx) = oneshot::channel();
-        if self
-            .cmd_tx
-            .send(Cmd::UserName { user_id, reply })
+        if send_cmd(&self.cmd_tx, Cmd::UserName { user_id, reply })
             .await
             .is_err()
         {
@@ -230,9 +236,7 @@ impl Client {
 
     pub async fn chat_face(&self, chat_id: i64) -> ChatFace {
         let (reply, rx) = oneshot::channel();
-        if self
-            .cmd_tx
-            .send(Cmd::ChatFace { chat_id, reply })
+        if send_cmd(&self.cmd_tx, Cmd::ChatFace { chat_id, reply })
             .await
             .is_err()
         {
@@ -246,11 +250,16 @@ impl Client {
 
     pub async fn chat_photo(&self, chat_id: i64) -> std::result::Result<Option<String>, ()> {
         let (reply, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(Cmd::ChatPhoto { chat_id, reply })
+        if send_cmd(&self.cmd_tx, Cmd::ChatPhoto { chat_id, reply })
             .await
-            .map_err(|_| ())?;
-        rx.await.map_err(|_| ())?
+            .is_err()
+        {
+            return Err(());
+        }
+        match tokio::time::timeout(CMD_WAIT, rx).await {
+            Ok(Ok(photo)) => photo,
+            _ => Err(()),
+        }
     }
 
     pub async fn fetch_history(
@@ -260,27 +269,23 @@ impl Client {
         from_ms: i64,
     ) -> Result<Vec<Message>> {
         let (reply, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(Cmd::History {
+        send_cmd(
+            &self.cmd_tx,
+            Cmd::History {
                 chat_id,
                 backward,
                 from_ms,
                 reply,
-            })
-            .await
-            .map_err(|_| Error::Protocol("MAX connection stopped".into()))?;
-        rx.await
-            .map_err(|_| Error::Protocol("MAX connection stopped".into()))?
+            },
+        )
+        .await?;
+        wait_cmd(rx).await?
     }
 
     pub async fn chat_ids(&self) -> Result<Vec<i64>> {
         let (reply, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(Cmd::ChatIds { reply })
-            .await
-            .map_err(|_| Error::Protocol("MAX connection stopped".into()))?;
-        rx.await
-            .map_err(|_| Error::Protocol("MAX connection stopped".into()))
+        send_cmd(&self.cmd_tx, Cmd::ChatIds { reply }).await?;
+        wait_cmd(rx).await
     }
 
     pub async fn video_play_url(
@@ -290,18 +295,40 @@ impl Client {
         video_id: i64,
     ) -> Result<String> {
         let (reply, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(Cmd::VideoPlay {
+        send_cmd(
+            &self.cmd_tx,
+            Cmd::VideoPlay {
                 chat_id,
                 message_id,
                 video_id,
                 reply,
-            })
-            .await
-            .map_err(|_| Error::Protocol("MAX connection stopped".into()))?;
-        rx.await
-            .map_err(|_| Error::Protocol("MAX connection stopped".into()))?
+            },
+        )
+        .await?;
+        wait_cmd(rx).await?
     }
+}
+
+async fn send_cmd(tx: &mpsc::Sender<Cmd>, cmd: Cmd) -> Result<()> {
+    beat();
+    let result = match tokio::time::timeout(CMD_WAIT, tx.send(cmd)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(Error::Protocol("MAX connection stopped".into())),
+        Err(_) => Err(Error::Protocol("MAX request timed out".into())),
+    };
+    beat();
+    result
+}
+
+async fn wait_cmd<T>(rx: oneshot::Receiver<T>) -> Result<T> {
+    beat();
+    let result = match tokio::time::timeout(CMD_WAIT, rx).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) => Err(Error::Protocol("MAX connection stopped".into())),
+        Err(_) => Err(Error::Protocol("MAX request timed out".into())),
+    };
+    beat();
+    result
 }
 
 pub struct PendingAuth {
@@ -492,13 +519,16 @@ async fn run_forever(
     voice_cids: Arc<Mutex<Vec<i64>>>,
 ) -> Result<()> {
     let mut attempt = 0u32;
+    let mut queued = VecDeque::new();
     loop {
+        beat();
         match run_once(
             &mut session,
             &session_path,
             &mut cmd_rx,
             &event_tx,
             &voice_cids,
+            &mut queued,
         )
         .await
         {
@@ -511,15 +541,19 @@ async fn run_forever(
                     ));
                 }
                 while voice_hold.load(Ordering::SeqCst) {
+                    beat();
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
                 attempt = attempt.saturating_add(1);
                 let delay = Duration::from_secs(u64::from(attempt.min(5)));
-                let _ = event_tx
-                    .send(Event::Logged {
+                push_event(
+                    &event_tx,
+                    &mut queued,
+                    Event::Logged {
                         note: format!("{err}; reconnecting"),
-                    })
-                    .await;
+                    },
+                );
+                beat();
                 tokio::time::sleep(delay).await;
             }
         }
@@ -568,6 +602,7 @@ async fn run_once(
     cmd_rx: &mut mpsc::Receiver<Cmd>,
     event_tx: &mpsc::Sender<Event>,
     voice_cids: &Mutex<Vec<i64>>,
+    queued: &mut VecDeque<Event>,
 ) -> Result<()> {
     let mut link = connect().await?;
     let mut pending = HashMap::<i64, Waiter>::new();
@@ -650,14 +685,14 @@ async fn run_once(
         }
     }
 
-    let _ = event_tx
-        .send(Event::Ready { me })
-        .await;
-    let _ = event_tx
-        .send(Event::Logged {
+    push_event(event_tx, queued, Event::Ready { me });
+    push_event(
+        event_tx,
+        queued,
+        Event::Logged {
             note: "logged in".into(),
-        })
-        .await;
+        },
+    );
 
     let cid = Arc::new(AtomicI64::new(now_ms()));
     let mut sent_cids = VecDeque::new();
@@ -666,6 +701,8 @@ async fn run_once(
     let mut last_rx = tokio::time::Instant::now();
 
     loop {
+        beat();
+        flush_events(event_tx, queued);
         if let Ok(mut extra) = voice_cids.lock() {
             for cid in extra.drain(..) {
                 remember_cid(&mut sent_cids, cid);
@@ -903,6 +940,9 @@ async fn run_once(
                     }
                 }
             }
+            _ = tokio::time::sleep(Duration::from_millis(200)), if !queued.is_empty() => {
+                flush_events(event_tx, queued);
+            }
             _ = tokio::time::sleep_until(last_rx + QUIET_FOR) => {
                 fail_pending(&mut pending, "MAX connection is quiet");
                 return Err(Error::Protocol("MAX connection is quiet".into()));
@@ -927,6 +967,7 @@ async fn fill_chats(
     let mut marker = now_ms();
     let mut seen_pages = HashSet::new();
     for _ in 0..50 {
+        beat();
         let payload = match roundtrip(
             link,
             pending,
@@ -1403,6 +1444,33 @@ fn finish_waiter(
     }
 }
 
+// A full bridge inbox must not stall the MAX socket. Keep the latest status and send it when there is room.
+fn push_event(tx: &mpsc::Sender<Event>, queued: &mut VecDeque<Event>, event: Event) {
+    queued.retain(|old| match (&event, old) {
+        (Event::Ready { .. }, Event::Ready { .. }) => false,
+        (Event::Logged { .. }, Event::Logged { .. }) => false,
+        _ => true,
+    });
+    queued.push_back(event);
+    flush_events(tx, queued);
+}
+
+fn flush_events(tx: &mpsc::Sender<Event>, queued: &mut VecDeque<Event>) {
+    while let Some(event) = queued.pop_front() {
+        match tx.try_send(event) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                queued.push_front(event);
+                return;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                queued.clear();
+                return;
+            }
+        }
+    }
+}
+
 fn fail_pending(pending: &mut HashMap<i64, Waiter>, note: &str) {
     for (_, waiter) in pending.drain() {
         fail_waiter(waiter, note);
@@ -1498,6 +1566,7 @@ async fn roundtrip(
     let seq = send_frame(link, pending, opcode, payload, Waiter::Ignore).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
+        beat();
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             pending.remove(&seq);
@@ -1749,6 +1818,44 @@ mod tests {
             next_chat_marker(&json!({}), 20, &[], &mut std::collections::HashSet::new()),
             None
         );
+    }
+
+    #[test]
+    fn a_full_event_queue_keeps_the_latest_status() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (tx, mut rx) = mpsc::channel(1);
+            let mut queued = VecDeque::new();
+            push_event(&tx, &mut queued, Event::Ready { me: 1 });
+            push_event(
+                &tx,
+                &mut queued,
+                Event::Logged {
+                    note: "reconnecting".into(),
+                },
+            );
+            push_event(
+                &tx,
+                &mut queued,
+                Event::Logged {
+                    note: "logged in".into(),
+                },
+            );
+            assert_eq!(queued.len(), 1);
+            match rx.recv().await.unwrap() {
+                Event::Ready { me } => assert_eq!(me, 1),
+                other => panic!("expected ready, got {other:?}"),
+            }
+            flush_events(&tx, &mut queued);
+            match rx.recv().await.unwrap() {
+                Event::Logged { note } => assert_eq!(note, "logged in"),
+                other => panic!("expected logged, got {other:?}"),
+            }
+            assert!(queued.is_empty());
+        });
     }
 
     #[test]
