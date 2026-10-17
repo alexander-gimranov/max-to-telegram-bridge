@@ -51,7 +51,7 @@ The bridge reads these variables from the environment or from `var/bridge.env`. 
 | `TELEGRAM_ALLOWED_USER_IDS` | Yes | Comma-separated Telegram user ids that can use the bot. |
 | `MODE` | No | `Chat` or `Thread`. The default is `Chat`. |
 
-Optional path variables: `MAX_VAR`, `MAX_ENV_PATH`, `MAX_SESSION_PATH`, `MAX_MAP_PATH`, `MAX_LINKS_PATH`, `MAX_TOPICS_PATH`, `MAX_OFFSET_PATH`, `MAX_SEEN_PATH`.
+Optional path variables: `MAX_VAR`, `MAX_ENV_PATH`, `MAX_SESSION_PATH`, `MAX_MAP_PATH`, `MAX_LINKS_PATH`, `MAX_RECEIPTS_PATH`, `MAX_TOPICS_PATH`, `MAX_OFFSET_PATH`, `MAX_SEEN_PATH`.
 
 ## Sign in
 
@@ -94,6 +94,20 @@ In `Thread` mode the bot shows these controls after MAX is connected:
 The MAX favorites chat is copied under the label **Favorites** or **Избранное**, matching `LANGUAGE`. Live messages that you send from another MAX client are copied only in that chat. A history load includes your own messages and starts them with **you** or **ты**.
 
 When both services provide the file, photos, voice messages, and videos are copied in both directions.
+
+## Message status
+
+Telegram bots cannot show native delivery ticks. The bridge uses reactions on your outbound messages:
+
+- ⏳ — MAX accepted the message (`sent`)
+- ✅ — delivered to the peer (`arrived`)
+- 👀 — the peer read it in MAX (`read`)
+
+On an inbound message from MAX, add the 👀 reaction in Telegram to mark that message read in MAX. The bridge does not mark MAX messages read automatically when it forwards them.
+
+After a MAX reconnect, the bridge refreshes pending outbound statuses from chat read watermarks and retries any queued mark-read actions.
+
+Optional path: `MAX_RECEIPTS_PATH` (default `var/receipts.json`).
 
 ## Project layout
 

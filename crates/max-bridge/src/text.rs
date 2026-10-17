@@ -13,6 +13,10 @@ mod lang {
     pub const DELETED: &str = "(deleted)";
     pub const NOT_FORWARDED: &str = "(attachment is not forwarded)";
     pub const FORWARDED_BY: &str = "Forwarded by ";
+
+    pub fn chat_created(title: &str) -> String {
+        format!("You created the chat \"{title}\"")
+    }
     pub const SETUP: &str = "Set up";
     pub const LOAD_HISTORY: &str = "Load history";
     pub const RELOAD_HISTORY: &str = "Reload history";
@@ -47,6 +51,18 @@ mod lang {
     pub const ENTER_PASSWORD: &str = "Enter the cloud password";
     pub const CODE_FIRST: &str = "Enter the code first";
     pub const SIGNED_IN: &str = "Signed in.";
+    pub const ADD_CONTACT: &str = "Add contact";
+    pub const CONTACTS_TITLE: &str = "Add a MAX contact";
+    pub const NAME_LABEL: &str = "Name";
+    pub const ADD: &str = "Add";
+    pub const ENTER_NAME: &str = "Enter a name";
+    pub const CONTACT_ADDED: &str = "Contact added.";
+    pub const CONTACT_EXISTS: &str = "This contact is already saved.";
+    pub const CONTACT_MISSING: &str = "This number is not in MAX.";
+    pub const CONTACT_PRIVACY: &str =
+        "This person accepts messages only from their contacts.";
+    pub const CONTACTS_NEED_SESSION: &str = "MAX is not signed in.";
+    pub const CONTACTS_PAGE_ERROR: &str = "The contacts page did not respond.";
 
     pub fn code_call(digits: i64, wait_secs: i64) -> String {
         format!(
@@ -68,6 +84,10 @@ mod lang {
     pub const DELETED: &str = "(удалено)";
     pub const NOT_FORWARDED: &str = "(вложение не пересылается)";
     pub const FORWARDED_BY: &str = "Переслано от ";
+
+    pub fn chat_created(title: &str) -> String {
+        format!("Вы создали чат «{title}»")
+    }
     pub const SETUP: &str = "Настроить";
     pub const LOAD_HISTORY: &str = "Загрузить историю";
     pub const RELOAD_HISTORY: &str = "Перечитать историю";
@@ -101,6 +121,18 @@ mod lang {
     pub const ENTER_PASSWORD: &str = "введите облачный пароль";
     pub const CODE_FIRST: &str = "сначала введите код";
     pub const SIGNED_IN: &str = "Вход выполнен.";
+    pub const ADD_CONTACT: &str = "Добавить контакт";
+    pub const CONTACTS_TITLE: &str = "Контакт MAX";
+    pub const NAME_LABEL: &str = "Имя";
+    pub const ADD: &str = "Добавить";
+    pub const ENTER_NAME: &str = "введите имя";
+    pub const CONTACT_ADDED: &str = "Контакт добавлен.";
+    pub const CONTACT_EXISTS: &str = "Контакт уже в книге.";
+    pub const CONTACT_MISSING: &str = "Этого номера нет в MAX.";
+    pub const CONTACT_PRIVACY: &str =
+        "Этот человек принимает сообщения только от своих контактов.";
+    pub const CONTACTS_NEED_SESSION: &str = "Вход в MAX не выполнен.";
+    pub const CONTACTS_PAGE_ERROR: &str = "Страница контактов не ответила.";
 
     pub fn code_call(digits: i64, wait_secs: i64) -> String {
         format!("MAX звонит. Код из {digits} цифр. Ждите звонок до {wait_secs} с.")

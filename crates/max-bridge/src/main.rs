@@ -7,21 +7,28 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::net::SocketAddr;
 use std::panic::{self, AssertUnwindSafe};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use max_client::{
-    beat, beat_age, lookup_v4, read_session, Attach, ChatFace, Client, Event, Media, Message,
+    beat, beat_age, contact_error_kind, lookup_v4, Attach, ChatFace, Client, ContactErrorKind,
+    Cursor, Event, InReceipt, Links, Media, Message, OutReceipt, PendingMark, ReceiptStatus,
+    Receipts, SessionLink, Store, Topic,
 };
 use reqwest::multipart::{Form, Part};
 use reqwest::Client as Http;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::watch;
 
 const TELEGRAM_HOST: &str = "api.telegram.org";
 const MAX_MEDIA_BYTES: usize = 20 * 1024 * 1024;
 const STALL_AFTER_SECS: u64 = 180;
+const REACT_SENT: &str = "⏳";
+const REACT_ARRIVED: &str = "✅";
+const REACT_READ: &str = "👀";
 
 fn main() {
     let mut pause = Duration::from_secs(2);
@@ -95,12 +102,7 @@ struct Config {
     token: String,
     allowed: Vec<i64>,
     mode: Mode,
-    session_path: PathBuf,
-    map_path: PathBuf,
-    links_path: PathBuf,
-    topics_path: PathBuf,
-    offset_path: PathBuf,
-    seen_path: PathBuf,
+    store: Arc<Store>,
 }
 
 impl Config {
@@ -129,16 +131,13 @@ impl Config {
             .or_else(|| file_values.remove("MODE"))
             .unwrap_or_default();
         let mode = parse_mode(&mode_raw)?;
+        let db_path = data_path("MAX_DB_PATH", "max.db");
+        let store = Arc::new(Store::open(&db_path).map_err(|err| err.to_string())?);
         Ok(Config {
             token,
             allowed,
             mode,
-            session_path: data_path("MAX_SESSION_PATH", "session.json"),
-            map_path: data_path("MAX_MAP_PATH", "map.json"),
-            links_path: data_path("MAX_LINKS_PATH", "links.json"),
-            topics_path: data_path("MAX_TOPICS_PATH", "topics.json"),
-            offset_path: data_path("MAX_OFFSET_PATH", "tg-offset"),
-            seen_path: data_path("MAX_SEEN_PATH", "seen.json"),
+            store,
         })
     }
 }
@@ -285,6 +284,7 @@ fn panel_markup(link: LinkState) -> Value {
         }),
         LinkState::Ready => json!({
             "inline_keyboard": [
+                [{"text": text::ADD_CONTACT, "web_app": {"url": auth_http::CONTACTS_URL}}],
                 [{"text": text::LOAD_HISTORY, "callback_data": "history"}],
                 [{"text": text::RELOAD_HISTORY, "callback_data": "reread"}],
                 [{"text": text::SIGN_OUT, "callback_data": "logout"}]
@@ -337,7 +337,7 @@ async fn sync_controls(
     let markup = panel_markup(link);
     let commands = command_list(link);
     for user_id in &config.allowed {
-        let _ = telegram(
+        if let Err(err) = telegram(
             http,
             &config.token,
             "setMyCommands",
@@ -346,9 +346,12 @@ async fn sync_controls(
                 "scope": {"type": "chat", "chat_id": user_id}
             }),
         )
-        .await;
+        .await
+        {
+            eprintln!("bridge: {err}");
+        }
         if let Some(message_id) = panels.get(user_id).copied() {
-            let edited = telegram(
+            match telegram(
                 http,
                 &config.token,
                 "editMessageText",
@@ -359,12 +362,13 @@ async fn sync_controls(
                     "reply_markup": markup.clone(),
                 }),
             )
-            .await;
-            if edited.is_ok() {
-                continue;
+            .await
+            {
+                Ok(_) => continue,
+                Err(err) => eprintln!("bridge: {err}"),
             }
         }
-        if let Ok(payload) = telegram(
+        match telegram(
             http,
             &config.token,
             "sendMessage",
@@ -376,9 +380,12 @@ async fn sync_controls(
         )
         .await
         {
-            if let Some(message_id) = sent_message_id(&payload) {
-                panels.insert(*user_id, message_id);
+            Ok(payload) => {
+                if let Some(message_id) = sent_message_id(&payload) {
+                    panels.insert(*user_id, message_id);
+                }
             }
+            Err(err) => eprintln!("bridge: {err}"),
         }
     }
 }
@@ -412,8 +419,8 @@ async fn clear_reply_keyboard(http: &Http, config: &Config) {
     }
 }
 
-fn forget_session(path: &Path) {
-    let _ = fs::remove_file(path);
+fn forget_session(store: &Store) {
+    let _ = store.clear_session();
 }
 
 async fn ask_logout(http: &Http, config: &Config, asks: &mut HashMap<i64, i64>, user_id: i64) {
@@ -450,20 +457,30 @@ async fn ask_logout(http: &Http, config: &Config, asks: &mut HashMap<i64, i64>, 
     }
 }
 
+fn set_client(
+    slot: &mut Option<Client>,
+    published: &watch::Sender<Option<SessionLink>>,
+    next: Option<Client>,
+) {
+    let _ = published.send(next.as_ref().map(Client::link));
+    *slot = next;
+}
+
 async fn begin_logout(
     config: &Config,
     http: &Http,
     client: &mut Option<Client>,
+    session_link: &watch::Sender<Option<SessionLink>>,
     link: &mut LinkState,
     me: &mut Option<i64>,
     panels: &mut HashMap<i64, i64>,
     logout_asks: &mut HashMap<i64, i64>,
     user_id: i64,
 ) {
-    *client = None;
+    set_client(client, session_link, None);
     *link = LinkState::Off;
     *me = None;
-    forget_session(&config.session_path);
+    forget_session(&config.store);
     sync_controls(http, config, *link, panels).await;
     ask_logout(http, config, logout_asks, user_id).await;
 }
@@ -487,11 +504,12 @@ async fn close_logout_ask(
 }
 
 async fn run(config: Config) -> Result<(), String> {
-    let mut map = load_map(&config.map_path);
-    let mut links = load_links(&config.links_path);
-    let mut topics = load_topics(&config.topics_path);
-    let mut offset = load_offset(&config.offset_path);
-    let mut seen = load_seen(&config.seen_path);
+    let mut map = config.store.load_map();
+    let mut links = config.store.load_links();
+    let mut receipts = config.store.load_receipts();
+    let mut topics = config.store.load_topics();
+    let mut offset = config.store.load_offset();
+    let mut seen = config.store.load_seen();
     let mut ready_count = 0u32;
     eprintln!(
         "bridge: mode is {}",
@@ -500,7 +518,7 @@ async fn run(config: Config) -> Result<(), String> {
             Mode::Thread => "Thread",
         }
     );
-    let auth = auth_http::AuthHub::new(config.session_path.clone());
+    let auth = auth_http::AuthHub::new(Arc::clone(&config.store));
     let mut auth_notes = auth.subscribe();
     let auth_page = auth.clone();
     tokio::spawn(async move {
@@ -508,17 +526,26 @@ async fn run(config: Config) -> Result<(), String> {
             eprintln!("bridge: auth page failed: {err}");
         }
     });
+    let (session_link, contacts_link) = watch::channel(None::<SessionLink>);
+    let contacts_dir = var_dir();
+    tokio::spawn(async move {
+        if let Err(err) = auth_http::listen_contacts(contacts_link, contacts_dir).await {
+            eprintln!("bridge: contacts page failed: {err}");
+        }
+    });
     let mut http = telegram_http().await?;
     clear_reply_keyboard(&http, &config).await;
     let mut client = None;
     let mut link = LinkState::Off;
-    if read_session(&config.session_path)
+    if config
+        .store
+        .read_session()
         .map_err(|err| err.to_string())?
         .is_some()
     {
-        match Client::start(config.session_path.clone()).await {
+        match Client::start(Arc::clone(&config.store)).await {
             Ok(started) => {
-                client = Some(started);
+                set_client(&mut client, &session_link, Some(started));
                 link = LinkState::Connecting;
             }
             Err(err) => eprintln!("bridge: {err}"),
@@ -531,13 +558,13 @@ async fn run(config: Config) -> Result<(), String> {
     let mut echoes = HashSet::<i64>::new();
     loop {
         beat();
-        if client.is_none() && read_session(&config.session_path).ok().flatten().is_some() {
+        if client.is_none() && config.store.read_session().ok().flatten().is_some() {
             eprintln!("bridge: MAX client stopped; starting again");
             tokio::time::sleep(Duration::from_secs(2)).await;
             beat();
-            match Client::start(config.session_path.clone()).await {
+            match Client::start(Arc::clone(&config.store)).await {
                 Ok(started) => {
-                    client = Some(started);
+                    set_client(&mut client, &session_link, Some(started));
                     link = LinkState::Connecting;
                     sync_controls(&http, &config, link, &mut panels).await;
                 }
@@ -556,10 +583,10 @@ async fn run(config: Config) -> Result<(), String> {
         match wake {
             Wake::Auth { changed: false } => {}
             Wake::Auth { changed: true } => {
-                if client.is_none() && read_session(&config.session_path).ok().flatten().is_some() {
-                    match Client::start(config.session_path.clone()).await {
+                if client.is_none() && config.store.read_session().ok().flatten().is_some() {
+                    match Client::start(Arc::clone(&config.store)).await {
                         Ok(started) => {
-                            client = Some(started);
+                            set_client(&mut client, &session_link, Some(started));
                             link = LinkState::Connecting;
                             sync_controls(&http, &config, link, &mut panels).await;
                         }
@@ -577,14 +604,16 @@ async fn run(config: Config) -> Result<(), String> {
             Wake::Telegram(Ok(updates)) => {
                 for update in updates {
                     offset = update.update_id.saturating_add(1);
-                    save_offset(&config.offset_path, offset);
+                    config.store.save_offset(offset);
                     if let Err(err) = handle_update(
                         &config,
                         &mut http,
                         &mut client,
+                        &session_link,
                         &mut link,
                         &mut map,
                         &mut links,
+                        &mut receipts,
                         &mut topics,
                         &mut seen,
                         &mut echoes,
@@ -600,7 +629,7 @@ async fn run(config: Config) -> Result<(), String> {
                 }
             }
             Wake::Max(None) => {
-                client = None;
+                set_client(&mut client, &session_link, None);
                 if link != LinkState::Off {
                     link = LinkState::Off;
                     me = None;
@@ -623,12 +652,24 @@ async fn run(config: Config) -> Result<(), String> {
                         sync_controls(&http, &config, link, &mut panels).await;
                     }
                     if let Some(active) = client.as_mut() {
+                        if let Err(err) =
+                            flush_pending_marks(active, &config, &mut receipts).await
+                        {
+                            eprintln!("bridge: pending mark flush failed: {err}");
+                        }
+                        if let Err(err) =
+                            resync_out_receipts(active, &config, &mut http, &mut receipts, id)
+                                .await
+                        {
+                            eprintln!("bridge: receipt resync failed: {err}");
+                        }
                         match catch_up(
                             &config,
                             &mut http,
                             active,
                             &mut map,
                             &mut links,
+                            &mut receipts,
                             &mut topics,
                             me,
                             &mut seen,
@@ -646,25 +687,56 @@ async fn run(config: Config) -> Result<(), String> {
                 Event::Logged { note } => {
                     eprintln!("bridge: {note}");
                     if session_rejected(&note) {
-                        client = None;
+                        set_client(&mut client, &session_link, None);
                         link = LinkState::Off;
                         me = None;
                         sync_controls(&http, &config, link, &mut panels).await;
                     }
+                }
+                Event::Contact { dialog, name } => {
+                    if config.mode != Mode::Thread {
+                        eprintln!("bridge: contact saved, topic needs Thread mode");
+                        continue;
+                    }
+                    let Some(active) = client.as_mut() else {
+                        continue;
+                    };
+                    let users = config.allowed.clone();
+                    for tg_user in users {
+                        if let Err(err) = open_history_topic(
+                            &config,
+                            &mut http,
+                            active,
+                            &mut topics,
+                            tg_user,
+                            dialog,
+                            &name,
+                        )
+                        .await
+                        {
+                            eprintln!("bridge: contact topic failed for chat {dialog}: {err}");
+                        }
+                    }
+                }
+                Event::Delivered(mark) => {
+                    apply_delivery_status(&config, &mut http, &mut receipts, &mark).await;
+                }
+                Event::Read(mark) => {
+                    apply_read_status(&config, &mut http, &mut receipts, &mark, me).await;
                 }
                 Event::Message(message) => {
                     let Some(active) = client.as_mut() else {
                         continue;
                     };
                     if echoes.remove(&message.id) {
-                        mark_seen(&mut seen, &config.seen_path, &message);
+                        mark_seen(&mut seen, &config.store, &message);
                         continue;
                     }
                     if !is_unseen(&message, cursor_of(&seen, message.chat_id)) {
                         continue;
                     }
                     if !forward_message(&message, me) || skipped_status(&message) {
-                        mark_seen(&mut seen, &config.seen_path, &message);
+                        mark_seen(&mut seen, &config.store, &message);
                         continue;
                     }
                     if let Err(err) = forward_max(
@@ -673,6 +745,7 @@ async fn run(config: Config) -> Result<(), String> {
                         active,
                         &mut map,
                         &mut links,
+                        &mut receipts,
                         &mut topics,
                         &message,
                         me,
@@ -685,18 +758,12 @@ async fn run(config: Config) -> Result<(), String> {
                             http = fresh;
                         }
                     } else {
-                        mark_seen(&mut seen, &config.seen_path, &message);
+                        mark_seen(&mut seen, &config.store, &message);
                     }
                 }
             },
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-struct Cursor {
-    time: i64,
-    id: i64,
 }
 
 fn cursor_of(seen: &HashMap<i64, Cursor>, chat_id: Option<i64>) -> Option<Cursor> {
@@ -737,7 +804,7 @@ fn baseline_cursor(messages: &[Message]) -> Option<Cursor> {
         })
 }
 
-fn mark_seen(seen: &mut HashMap<i64, Cursor>, path: &std::path::Path, message: &Message) {
+fn mark_seen(seen: &mut HashMap<i64, Cursor>, store: &Store, message: &Message) {
     let Some(chat_id) = message.chat_id else {
         return;
     };
@@ -751,7 +818,7 @@ fn mark_seen(seen: &mut HashMap<i64, Cursor>, path: &std::path::Path, message: &
             id: message.id,
         },
     );
-    save_seen(path, seen);
+    store.save_seen(seen);
 }
 
 fn unix_ms() -> i64 {
@@ -761,12 +828,194 @@ fn unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
+async fn apply_out_status(
+    config: &Config,
+    http: &mut Http,
+    receipts: &mut Receipts,
+    max_message: i64,
+    next: ReceiptStatus,
+) {
+    let Some(receipt) = receipts.out.get_mut(&max_message) else {
+        return;
+    };
+    if !raise_out_status(receipt, next) {
+        return;
+    }
+    let tg_chat = receipt.tg_chat;
+    let tg_message = receipt.tg_message;
+    let emoji = status_emoji(receipt.status);
+    config.store.save_receipts(receipts);
+    if let Err(err) = set_reaction(http, &config.token, tg_chat, tg_message, emoji).await {
+        eprintln!("bridge: reaction failed: {err}");
+    }
+}
+
+async fn apply_delivery_status(
+    config: &Config,
+    http: &mut Http,
+    receipts: &mut Receipts,
+    mark: &max_client::DeliveryMark,
+) {
+    if mark.message_ids.is_empty() {
+        return;
+    }
+    for max_id in &mark.message_ids {
+        apply_out_status(config, http, receipts, *max_id, ReceiptStatus::Arrived).await;
+    }
+}
+
+async fn apply_read_status(
+    config: &Config,
+    http: &mut Http,
+    receipts: &mut Receipts,
+    mark: &max_client::ReadMark,
+    me: Option<i64>,
+) {
+    let mut targets: Vec<i64> = mark.message_ids.clone();
+    if targets.is_empty() && mark.mark > 0 {
+        targets = receipts
+            .out
+            .iter()
+            .filter(|(_, item)| {
+                item.max_chat == mark.chat_id
+                    && item.time > 0
+                    && item.time <= mark.mark
+                    && item.status < ReceiptStatus::Read
+                    && match mark.user_id {
+                        Some(user) => Some(user) != me,
+                        None => true,
+                    }
+            })
+            .map(|(id, _)| *id)
+            .collect();
+    }
+    for max_id in targets {
+        apply_out_status(config, http, receipts, max_id, ReceiptStatus::Read).await;
+    }
+}
+
+async fn flush_pending_marks(
+    client: &Client,
+    config: &Config,
+    receipts: &mut Receipts,
+) -> Result<(), String> {
+    if receipts.pending_marks.is_empty() {
+        return Ok(());
+    }
+    let pending = std::mem::take(&mut receipts.pending_marks);
+    let mut left = Vec::new();
+    for item in pending {
+        match client
+            .mark_read(item.max_chat, item.max_message, item.mark)
+            .await
+        {
+            Ok(()) => {}
+            Err(err) => {
+                eprintln!("bridge: mark read failed: {err}");
+                left.push(item);
+            }
+        }
+    }
+    receipts.pending_marks = left;
+    config.store.save_receipts(receipts);
+    Ok(())
+}
+
+async fn resync_out_receipts(
+    client: &Client,
+    config: &Config,
+    http: &mut Http,
+    receipts: &mut Receipts,
+    me: i64,
+) -> Result<(), String> {
+    for chat_id in pending_out_chats(receipts) {
+        let marks = match client.chat_peer_marks(chat_id).await {
+            Ok(marks) => marks,
+            Err(err) => {
+                eprintln!("bridge: chat marks failed for {chat_id}: {err}");
+                continue;
+            }
+        };
+        let peer_mark = marks
+            .iter()
+            .filter(|(user, _)| **user != me)
+            .map(|(_, mark)| *mark)
+            .max()
+            .unwrap_or(0);
+        if peer_mark <= 0 {
+            continue;
+        }
+        let ready: Vec<i64> = receipts
+            .out
+            .iter()
+            .filter(|(_, item)| {
+                item.max_chat == chat_id
+                    && item.time > 0
+                    && item.time <= peer_mark
+                    && item.status < ReceiptStatus::Read
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for max_id in ready {
+            apply_out_status(config, http, receipts, max_id, ReceiptStatus::Read).await;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_read_reaction(
+    config: &Config,
+    http: &mut Http,
+    client: &mut Option<Client>,
+    receipts: &mut Receipts,
+    reaction: &MessageReactionUpdate,
+) -> Result<(), String> {
+    let Some(user) = reaction.user.as_ref() else {
+        return Ok(());
+    };
+    if !config.allowed.contains(&user.id) && !config.allowed.contains(&reaction.chat.id) {
+        return Ok(());
+    }
+    let eyes = reaction.new_reaction.iter().any(|item| {
+        item.kind == "emoji" && item.emoji.as_deref() == Some(REACT_READ)
+    });
+    if !eyes {
+        return Ok(());
+    }
+    let Some(inbound) = receipts.inbound.get(&reaction.message_id).cloned() else {
+        return Ok(());
+    };
+    let mark = if inbound.time > 0 {
+        inbound.time
+    } else {
+        unix_ms()
+    };
+    if let Some(active) = client.as_ref() {
+        match active
+            .mark_read(inbound.max_chat, inbound.max_message, mark)
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(err) => eprintln!("bridge: mark read failed: {err}"),
+        }
+    }
+    receipts.pending_marks.push(PendingMark {
+        max_chat: inbound.max_chat,
+        max_message: inbound.max_message,
+        mark,
+    });
+    config.store.save_receipts(receipts);
+    let _ = http;
+    Ok(())
+}
+
 async fn catch_up(
     config: &Config,
     http: &mut Http,
     client: &mut Client,
     map: &mut HashMap<i64, i64>,
     links: &mut Links,
+    receipts: &mut Receipts,
     topics: &mut HashMap<String, Topic>,
     me: Option<i64>,
     seen: &mut HashMap<i64, Cursor>,
@@ -802,7 +1051,7 @@ async fn catch_up(
             if cursor.is_none() {
                 if let Some(head) = baseline_cursor(&batch) {
                     seen.insert(chat_id, head);
-                    save_seen(&config.seen_path, seen);
+                    config.store.save_seen(seen);
                 }
                 break;
             }
@@ -820,15 +1069,15 @@ async fn catch_up(
         }
         for message in take_missed(missed, seen.get(&chat_id).copied()) {
             if echoes.remove(&message.id) {
-                mark_seen(seen, &config.seen_path, &message);
+                mark_seen(seen, &config.store, &message);
                 continue;
             }
             if !forward_message(&message, me) || skipped_status(&message) {
-                mark_seen(seen, &config.seen_path, &message);
+                mark_seen(seen, &config.store, &message);
                 continue;
             }
             if let Err(err) = forward_max(
-                config, http, client, map, links, topics, &message, me, false,
+                config, http, client, map, links, receipts, topics, &message, me, false,
             )
             .await
             {
@@ -838,7 +1087,7 @@ async fn catch_up(
                 }
                 break;
             }
-            mark_seen(seen, &config.seen_path, &message);
+            mark_seen(seen, &config.store, &message);
             forwarded += 1;
         }
     }
@@ -905,6 +1154,7 @@ async fn forward_max(
     client: &mut Client,
     map: &mut HashMap<i64, i64>,
     links: &mut Links,
+    receipts: &mut Receipts,
     topics: &mut HashMap<String, Topic>,
     message: &Message,
     me: Option<i64>,
@@ -915,15 +1165,20 @@ async fn forward_max(
     };
     let sender = lookup_name(client, message.sender).await;
     let face = client.chat_face(chat_id).await;
-    let own = history && me.is_some_and(|id| message.sender == Some(id));
-    let forward_name = forward_author(client, message).await;
+    let system = message.control.is_some();
+    let own = history && !system && me.is_some_and(|id| message.sender == Some(id));
+    let forward_name = if system {
+        None
+    } else {
+        forward_author(client, message).await
+    };
     let bold_prefix = header_prefix(forward_name.as_deref(), own, face.group, chat_id, &sender);
     let title = if chat_id == 0 {
         text::FAVORITES.to_owned()
     } else {
         face.label.clone()
     };
-    let topic_sender = if own { "" } else { sender.as_str() };
+    let topic_sender = if own || system { "" } else { sender.as_str() };
     if history {
         if let Some(max_id) = message.reply_to {
             if !links.max.contains_key(&max_id) {
@@ -979,10 +1234,12 @@ async fn forward_max(
                         client,
                         map,
                         links,
+                        receipts,
                         topics,
                         *user_id,
                         chat_id,
                         message.id,
+                        message.time,
                         message.reply_to,
                         &label,
                         caption,
@@ -1009,10 +1266,12 @@ async fn forward_max(
             return Ok(());
         }
     }
-    let body = if message.text.is_empty() {
-        text::NO_TEXT.to_owned()
-    } else {
+    let body = if !message.text.trim().is_empty() {
         message.text.clone()
+    } else if let Some(body) = system_body(message) {
+        body
+    } else {
+        text::NO_TEXT.to_owned()
     };
     match config.mode {
         Mode::Chat => {
@@ -1026,7 +1285,20 @@ async fn forward_max(
             }
             let text = clip(&format!("{who}\n\n{body}"), 4000);
             for user_id in &config.allowed {
-                send_feed(http, config, map, *user_id, &text, chat_id, &bold_prefix).await?;
+                send_feed(
+                    http,
+                    config,
+                    map,
+                    links,
+                    receipts,
+                    *user_id,
+                    &text,
+                    chat_id,
+                    message.id,
+                    message.time,
+                    &bold_prefix,
+                )
+                .await?;
             }
         }
         Mode::Thread => {
@@ -1049,9 +1321,11 @@ async fn forward_max(
                     client,
                     topics,
                     links,
+                    receipts,
                     *user_id,
                     chat_id,
                     message.id,
+                    message.time,
                     &label,
                     &text,
                     reply_to,
@@ -1073,9 +1347,13 @@ async fn forward_max(
                         http,
                         config,
                         map,
+                        links,
+                        receipts,
                         *user_id,
                         &fallback,
                         chat_id,
+                        message.id,
+                        message.time,
                         &bold_prefix,
                     )
                     .await?;
@@ -1090,16 +1368,26 @@ async fn send_feed(
     http: &mut Http,
     config: &Config,
     map: &mut HashMap<i64, i64>,
+    links: &mut Links,
+    receipts: &mut Receipts,
     user_id: i64,
     text: &str,
     chat_id: i64,
+    max_message: i64,
+    max_time: i64,
     bold_prefix: &str,
 ) -> Result<(), String> {
     let message_id = send_text(http, config, user_id, None, None, text, bold_prefix).await?;
-    if config.mode == Mode::Chat {
-        map.insert(message_id, chat_id);
-        save_map(&config.map_path, map);
-    }
+    note_telegram_message(
+        config,
+        map,
+        links,
+        receipts,
+        message_id,
+        chat_id,
+        max_message,
+        max_time,
+    );
     Ok(())
 }
 
@@ -1109,9 +1397,11 @@ async fn send_in_topic(
     client: &mut Client,
     topics: &mut HashMap<String, Topic>,
     links: &mut Links,
+    receipts: &mut Receipts,
     tg_user: i64,
     max_chat: i64,
     max_message: i64,
+    max_time: i64,
     label: &str,
     text: &str,
     reply_to: Option<i64>,
@@ -1135,7 +1425,7 @@ async fn send_in_topic(
         Ok(id) => id,
         Err(err) if thread_missing(&err) => {
             topics.remove(&key);
-            save_topics(&config.topics_path, topics);
+            config.store.save_topics(topics);
             let thread_id =
                 ensure_topic(http, config, client, topics, tg_user, max_chat, &key, &name).await?;
             send_thread(
@@ -1152,7 +1442,15 @@ async fn send_in_topic(
         Err(err) => return Err(err),
     };
     remember_link(links, tg_message, max_message);
-    save_links(&config.links_path, links);
+    config.store.save_links(links);
+    remember_inbound(
+        receipts,
+        &config.store,
+        tg_message,
+        max_chat,
+        max_message,
+        max_time,
+    );
     Ok(())
 }
 
@@ -1189,7 +1487,7 @@ async fn ensure_topic(
                             photo: topic.photo,
                         },
                     );
-                    save_topics(&config.topics_path, topics);
+                    config.store.save_topics(topics);
                 }
                 Err(err) => eprintln!("bridge: rename topic failed: {err}"),
             }
@@ -1227,7 +1525,7 @@ async fn ensure_topic(
             photo: false,
         },
     );
-    save_topics(&config.topics_path, topics);
+    config.store.save_topics(topics);
     pin_topic_photo(
         http, config, client, topics, tg_user, max_chat, key, thread_id,
     )
@@ -1320,7 +1618,7 @@ async fn pin_topic_photo(
 fn mark_topic_photo(config: &Config, topics: &mut HashMap<String, Topic>, key: &str) {
     if let Some(topic) = topics.get_mut(key) {
         topic.photo = true;
-        save_topics(&config.topics_path, topics);
+        config.store.save_topics(topics);
     }
 }
 
@@ -1411,16 +1709,39 @@ fn telegram_message_id(sent: &Value, method: &str) -> Result<i64, String> {
         .ok_or_else(|| format!("telegram {method} did not return a message"))
 }
 
+async fn set_reaction(
+    http: &Http,
+    token: &str,
+    chat_id: i64,
+    message_id: i64,
+    emoji: &str,
+) -> Result<(), String> {
+    telegram(
+        http,
+        token,
+        "setMessageReaction",
+        json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reaction": [{"type": "emoji", "emoji": emoji}],
+        }),
+    )
+    .await
+    .map(|_| ())
+}
+
 async fn send_media(
     http: &mut Http,
     config: &Config,
     client: &mut Client,
     map: &mut HashMap<i64, i64>,
     links: &mut Links,
+    receipts: &mut Receipts,
     topics: &mut HashMap<String, Topic>,
     tg_user: i64,
     max_chat: i64,
     max_message: i64,
+    max_time: i64,
     reply_to_max: Option<i64>,
     label: &str,
     caption: &str,
@@ -1483,7 +1804,16 @@ async fn send_media(
             }
         }
     };
-    note_telegram_message(config, map, links, tg_id, max_chat, max_message);
+    note_telegram_message(
+        config,
+        map,
+        links,
+        receipts,
+        tg_id,
+        max_chat,
+        max_message,
+        max_time,
+    );
     Ok(())
 }
 
@@ -1521,7 +1851,7 @@ async fn send_topic_media(
         Ok(id) => Ok(id),
         Err(err) if thread_missing(&err) => {
             topics.remove(&key);
-            save_topics(&config.topics_path, topics);
+            config.store.save_topics(topics);
             let thread_id =
                 ensure_topic(http, config, client, topics, tg_user, max_chat, &key, &name).await?;
             send_telegram_media(
@@ -1850,17 +2180,26 @@ fn note_telegram_message(
     config: &Config,
     map: &mut HashMap<i64, i64>,
     links: &mut Links,
+    receipts: &mut Receipts,
     tg_id: i64,
     max_chat: i64,
     max_message: i64,
+    time: i64,
 ) {
     if config.mode == Mode::Chat {
         map.insert(tg_id, max_chat);
-        save_map(&config.map_path, map);
-    } else {
-        remember_link(links, tg_id, max_message);
-        save_links(&config.links_path, links);
+        config.store.save_map(map);
     }
+    remember_link(links, tg_id, max_message);
+    config.store.save_links(links);
+    remember_inbound(
+        receipts,
+        &config.store,
+        tg_id,
+        max_chat,
+        max_message,
+        time,
+    );
 }
 
 fn image_mime(bytes: &[u8]) -> &'static str {
@@ -2133,6 +2472,9 @@ fn history_body(message: &Message) -> String {
     if !message.text.trim().is_empty() {
         return message.text.clone();
     }
+    if let Some(body) = system_body(message) {
+        return body;
+    }
     if !message.media.is_empty() {
         return String::new();
     }
@@ -2140,6 +2482,19 @@ fn history_body(message: &Message) -> String {
         text::DELETED.to_owned()
     } else {
         text::NOT_FORWARDED.to_owned()
+    }
+}
+
+fn system_body(message: &Message) -> Option<String> {
+    let control = message.control.as_ref()?;
+    let title = control
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty());
+    match (control.event.as_deref(), title) {
+        (Some("new"), Some(title)) => Some(text::chat_created(title)),
+        _ => None,
     }
 }
 
@@ -2235,6 +2590,7 @@ async fn wipe_bot_chat(
     http: &mut Http,
     map: &mut HashMap<i64, i64>,
     links: &mut Links,
+    receipts: &mut Receipts,
     topics: &mut HashMap<String, Topic>,
     tg_user: i64,
 ) {
@@ -2250,7 +2606,7 @@ async fn wipe_bot_chat(
         }
         topics.remove(&key);
     }
-    save_topics(&config.topics_path, topics);
+    config.store.save_topics(topics);
     let mut message_ids: Vec<i64> = links.tg.keys().copied().collect();
     message_ids.extend(map.keys().copied());
     message_ids.sort_unstable();
@@ -2282,9 +2638,13 @@ async fn wipe_bot_chat(
     }
     links.tg.clear();
     links.max.clear();
-    save_links(&config.links_path, links);
+    config.store.save_links(links);
+    receipts.out.retain(|_, item| item.tg_chat != tg_user);
+    receipts.inbound.clear();
+    receipts.pending_marks.clear();
+    config.store.save_receipts(receipts);
     map.clear();
-    save_map(&config.map_path, map);
+    config.store.save_map(map);
     eprintln!("bridge: cleared topics and bot history");
 }
 
@@ -2302,20 +2662,20 @@ async fn wipe_topic(
     if let Some(topic) = topics.remove(&key) {
         if let Err(err) = delete_topic(http, config, tg_user, topic.thread_id).await {
             topics.insert(key, topic);
-            save_topics(&config.topics_path, topics);
+            config.store.save_topics(topics);
             return Err(err);
         }
-        save_topics(&config.topics_path, topics);
+        config.store.save_topics(topics);
     }
     match read_chat_history(client, chat_id).await {
         Ok(history) => {
             drop_chat_links(links, &history);
-            save_links(&config.links_path, links);
+            config.store.save_links(links);
         }
         Err(err) => eprintln!("bridge: history links kept for chat {chat_id}: {err}"),
     }
     seen.remove(&chat_id);
-    save_seen(&config.seen_path, seen);
+    config.store.save_seen(seen);
     eprintln!("bridge: cleared topic for chat {chat_id}");
     Ok(())
 }
@@ -2346,8 +2706,12 @@ async fn open_history_topic(
     topics: &mut HashMap<String, Topic>,
     tg_user: i64,
     chat_id: i64,
+    contact_name: &str,
 ) -> Result<(), String> {
-    let face = client.chat_face(chat_id).await;
+    let mut face = client.chat_face(chat_id).await;
+    if face.label.is_empty() && !contact_name.is_empty() {
+        face.label = contact_name.to_owned();
+    }
     let name = topic_name(&topic_label(chat_id, &face, ""));
     let key = topic_key(tg_user, chat_id);
     for attempt in 0..3 {
@@ -2373,6 +2737,7 @@ async fn load_topic_history(
     client: &mut Client,
     map: &mut HashMap<i64, i64>,
     links: &mut Links,
+    receipts: &mut Receipts,
     topics: &mut HashMap<String, Topic>,
     seen: &mut HashMap<i64, Cursor>,
     me: Option<i64>,
@@ -2387,13 +2752,13 @@ async fn load_topic_history(
         if let Some(topic) = topics.remove(&key) {
             if let Err(err) = delete_topic(http, config, tg_user, topic.thread_id).await {
                 topics.insert(key, topic);
-                save_topics(&config.topics_path, topics);
+                config.store.save_topics(topics);
                 return Err(err);
             }
-            save_topics(&config.topics_path, topics);
+            config.store.save_topics(topics);
             drop_chat_links(links, &history);
-            save_links(&config.links_path, links);
-            open_history_topic(config, http, client, topics, tg_user, chat_id).await?;
+            config.store.save_links(links);
+            open_history_topic(config, http, client, topics, tg_user, chat_id, "").await?;
             eprintln!("bridge: topic recreated for chat {chat_id}");
             rewrite = true;
         }
@@ -2409,7 +2774,7 @@ async fn load_topic_history(
         let mut sent = false;
         for attempt in 0..3 {
             match forward_max(
-                config, http, client, map, links, topics, &outgoing, me, true,
+                config, http, client, map, links, receipts, topics, &outgoing, me, true,
             )
             .await
             {
@@ -2434,7 +2799,7 @@ async fn load_topic_history(
         }
         if sent {
             wrote += 1;
-            mark_seen(seen, &config.seen_path, message);
+            mark_seen(seen, &config.store, message);
         }
     }
     if wrote > 0 {
@@ -2479,24 +2844,50 @@ fn history_chat_ids(
     ids
 }
 
+fn history_topic_ids(started: &[i64], quiet: &[i64]) -> Vec<i64> {
+    let mut ids = started.to_vec();
+    for chat_id in quiet {
+        if !ids.contains(chat_id) {
+            ids.push(*chat_id);
+        }
+    }
+    ids.sort_unstable();
+    ids
+}
+
 async fn load_all_history(
     config: &Config,
     http: &mut Http,
     client: &mut Client,
     map: &mut HashMap<i64, i64>,
     links: &mut Links,
+    receipts: &mut Receipts,
     topics: &mut HashMap<String, Topic>,
     seen: &mut HashMap<i64, Cursor>,
     me: Option<i64>,
     tg_user: i64,
 ) -> Result<(), String> {
     let known = client.chat_ids().await.map_err(|err| err.to_string())?;
-    let chats = history_chat_ids(&known, seen, topics, tg_user);
-    eprintln!("bridge: history found {} chats", chats.len());
+    let started = history_chat_ids(&known, seen, topics, tg_user);
+    let quiet = match client.quiet_dialog_ids().await {
+        Ok(ids) => ids,
+        Err(err) => {
+            eprintln!("bridge: contact list failed: {err}");
+            Vec::new()
+        }
+    };
+    let chats = history_topic_ids(&started, &quiet);
+    eprintln!("bridge: history found {} chats", started.len());
+    eprintln!(
+        "bridge: history found {} contacts with no chat",
+        chats.len().saturating_sub(started.len())
+    );
     let mut ready = Vec::new();
     for chat_id in chats {
         let fresh = !topics.contains_key(&topic_key(tg_user, chat_id));
-        if let Err(err) = open_history_topic(config, http, client, topics, tg_user, chat_id).await {
+        if let Err(err) =
+            open_history_topic(config, http, client, topics, tg_user, chat_id, "").await
+        {
             eprintln!("bridge: history topic failed for chat {chat_id}: {err}");
             continue;
         }
@@ -2504,8 +2895,11 @@ async fn load_all_history(
     }
     eprintln!("bridge: history opened {} topics", ready.len());
     for (chat_id, fresh) in ready {
+        if !started.contains(&chat_id) {
+            continue;
+        }
         if let Err(err) = load_topic_history(
-            config, http, client, map, links, topics, seen, me, tg_user, chat_id, fresh,
+            config, http, client, map, links, receipts, topics, seen, me, tg_user, chat_id, fresh,
         )
         .await
         {
@@ -2538,6 +2932,7 @@ async fn run_history(
     client: &mut Client,
     map: &mut HashMap<i64, i64>,
     links: &mut Links,
+    receipts: &mut Receipts,
     topics: &mut HashMap<String, Topic>,
     seen: &mut HashMap<i64, Cursor>,
     me: Option<i64>,
@@ -2568,12 +2963,14 @@ async fn run_history(
                 return Ok(());
             }
         } else {
-            wipe_bot_chat(config, http, map, links, topics, tg_user).await;
+            wipe_bot_chat(config, http, map, links, receipts, topics, tg_user).await;
         }
     }
     if let Some(chat_id) = chat_id {
         let fresh = reread || !topics.contains_key(&topic_key(tg_user, chat_id));
-        if let Err(err) = open_history_topic(config, http, client, topics, tg_user, chat_id).await {
+        if let Err(err) =
+            open_history_topic(config, http, client, topics, tg_user, chat_id, "").await
+        {
             eprintln!("bridge: history topic failed for chat {chat_id}: {err}");
             return Ok(());
         }
@@ -2596,7 +2993,7 @@ async fn run_history(
         };
         post_status(http, config, tg_user, thread_id, loading).await;
         if let Err(err) = load_topic_history(
-            config, http, client, map, links, topics, seen, me, tg_user, chat_id, fresh,
+            config, http, client, map, links, receipts, topics, seen, me, tg_user, chat_id, fresh,
         )
         .await
         {
@@ -2606,7 +3003,7 @@ async fn run_history(
         return Ok(());
     }
     post_status(http, config, tg_user, None, text::HISTORY_LOADING).await;
-    load_all_history(config, http, client, map, links, topics, seen, me, tg_user).await?;
+    load_all_history(config, http, client, map, links, receipts, topics, seen, me, tg_user).await?;
     post_status(http, config, tg_user, None, text::HISTORY_DONE).await;
     Ok(())
 }
@@ -2615,9 +3012,11 @@ async fn handle_update(
     config: &Config,
     http: &mut Http,
     client: &mut Option<Client>,
+    session_link: &watch::Sender<Option<SessionLink>>,
     link: &mut LinkState,
     map: &mut HashMap<i64, i64>,
     links: &mut Links,
+    receipts: &mut Receipts,
     topics: &mut HashMap<String, Topic>,
     seen: &mut HashMap<i64, Cursor>,
     echoes: &mut HashSet<i64>,
@@ -2626,6 +3025,9 @@ async fn handle_update(
     logout_asks: &mut HashMap<i64, i64>,
     update: &Update,
 ) -> Result<(), String> {
+    if let Some(reaction) = &update.reaction {
+        return handle_read_reaction(config, http, client, receipts, reaction).await;
+    }
     if let Some(callback) = &update.callback {
         let _ = telegram(
             http,
@@ -2641,13 +3043,24 @@ async fn handle_update(
         let user_id = callback.from.id;
         match action {
             Some("logout") => {
-                begin_logout(config, http, client, link, me, panels, logout_asks, user_id).await;
+                begin_logout(
+                    config,
+                    http,
+                    client,
+                    session_link,
+                    link,
+                    me,
+                    panels,
+                    logout_asks,
+                    user_id,
+                )
+                .await;
                 return Ok(());
             }
             Some("logout_yes") => {
-                wipe_bot_chat(config, http, map, links, topics, user_id).await;
+                wipe_bot_chat(config, http, map, links, receipts, topics, user_id).await;
                 seen.clear();
-                save_seen(&config.seen_path, seen);
+                config.store.save_seen(seen);
                 close_logout_ask(http, config, logout_asks, user_id).await;
                 sync_controls(http, config, *link, panels).await;
                 return Ok(());
@@ -2675,6 +3088,7 @@ async fn handle_update(
             active,
             map,
             links,
+            receipts,
             topics,
             seen,
             *me,
@@ -2698,12 +3112,23 @@ async fn handle_update(
         if *link != LinkState::Off {
             return Ok(());
         }
-        forget_session(&config.session_path);
+        forget_session(&config.store);
         sync_controls(http, config, *link, panels).await;
         return Ok(());
     }
     if is_logout_command(&text) {
-        begin_logout(config, http, client, link, me, panels, logout_asks, from).await;
+        begin_logout(
+            config,
+            http,
+            client,
+            session_link,
+            link,
+            me,
+            panels,
+            logout_asks,
+            from,
+        )
+        .await;
         return Ok(());
     }
     if is_history_command(&text) || is_reread_command(&text) {
@@ -2730,6 +3155,7 @@ async fn handle_update(
             active,
             map,
             links,
+            receipts,
             topics,
             seen,
             *me,
@@ -2817,42 +3243,80 @@ async fn handle_update(
     if attaches.is_empty() && text.is_empty() && voice_file.is_none() && video_file.is_none() {
         return Ok(());
     }
-    let sent = if let Some((bytes, duration_ms)) = voice_file {
-        let sent = send_voice_on_tcp(
-            client,
-            chat_id,
-            &text,
-            reply_to,
-            &bytes,
-            duration_ms,
-            attaches,
+    let (sent, echo) = if let Some((bytes, duration_ms)) = voice_file {
+        (
+            send_voice_on_tcp(
+                client,
+                chat_id,
+                &text,
+                reply_to,
+                &bytes,
+                duration_ms,
+                attaches,
+            )
+            .await,
+            true,
         )
-        .await?;
-        if let Some(max_id) = sent {
-            echoes.insert(max_id);
-        }
-        sent
     } else if let Some((bytes, video_type)) = video_file {
         let body = if video_type == Some(1) {
             ""
         } else {
             text.as_str()
         };
-        let sent = send_video_on_tcp(
-            client, chat_id, body, reply_to, &bytes, video_type, attaches,
+        (
+            send_video_on_tcp(
+                client, chat_id, body, reply_to, &bytes, video_type, attaches,
+            )
+            .await,
+            true,
         )
-        .await?;
-        if let Some(max_id) = sent {
-            echoes.insert(max_id);
-        }
-        sent
     } else {
-        send_with_voice_retry(client, chat_id, &text, reply_to, attaches).await?
+        (
+            send_with_voice_retry(client, chat_id, &text, reply_to, attaches).await,
+            false,
+        )
     };
-    if config.mode == Mode::Thread && message.message_id != 0 {
+    let sent = match sent {
+        Ok(sent) => {
+            if echo {
+                if let Some(max_id) = sent {
+                    echoes.insert(max_id);
+                }
+            }
+            sent
+        }
+        Err(err) if contact_error_kind(&err) == ContactErrorKind::Privacy => {
+            eprintln!("bridge: {err}");
+            post_status(
+                http,
+                config,
+                from,
+                message.thread_id,
+                text::CONTACT_PRIVACY,
+            )
+            .await;
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
+    if message.message_id != 0 {
         if let Some(max_id) = sent {
             remember_link(links, message.message_id, max_id);
-            save_links(&config.links_path, links);
+            config.store.save_links(links);
+            remember_outbound(
+                receipts,
+                &config.store,
+                max_id,
+                from,
+                message.message_id,
+                chat_id,
+                unix_ms(),
+            );
+            if let Err(err) =
+                set_reaction(http, &config.token, from, message.message_id, REACT_SENT).await
+            {
+                eprintln!("bridge: reaction failed: {err}");
+            }
         }
     }
     Ok(())
@@ -2934,9 +3398,15 @@ async fn telegram_http() -> Result<Http, String> {
 async fn poll_telegram(http: &Http, token: &str, offset: i64) -> Result<Vec<Update>, String> {
     beat();
     let url = format!("https://api.telegram.org/bot{token}/getUpdates");
+    let allowed = serde_json::to_string(&["message", "callback_query", "message_reaction"])
+        .unwrap_or_else(|_| "[]".into());
     let response = http
         .get(url)
-        .query(&[("timeout", "25"), ("offset", &offset.to_string())])
+        .query(&[
+            ("timeout", "25"),
+            ("offset", &offset.to_string()),
+            ("allowed_updates", &allowed),
+        ])
         .send()
         .await
         .map_err(|err| err.to_string())?;
@@ -3431,6 +3901,30 @@ struct Update {
     message: Option<TgMessage>,
     #[serde(default, rename = "callback_query")]
     callback: Option<CallbackQuery>,
+    #[serde(default, rename = "message_reaction")]
+    reaction: Option<MessageReactionUpdate>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageReactionUpdate {
+    chat: TgChat,
+    message_id: i64,
+    user: Option<TgUser>,
+    #[serde(default)]
+    new_reaction: Vec<TgReaction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgChat {
+    id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgReaction {
+    #[serde(default, rename = "type")]
+    kind: String,
+    #[serde(default)]
+    emoji: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3504,103 +3998,78 @@ struct Reply {
     topic_created: Option<Value>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-struct Topic {
-    thread_id: i64,
-    name: String,
-    #[serde(default)]
-    photo: bool,
-}
-
-fn load_topics(path: &std::path::Path) -> HashMap<String, Topic> {
-    let Ok(raw) = fs::read_to_string(path) else {
-        return HashMap::new();
-    };
-    serde_json::from_str(&raw).unwrap_or_default()
-}
-
-fn save_topics(path: &std::path::Path, topics: &HashMap<String, Topic>) {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(raw) = serde_json::to_string(topics) {
-        let _ = fs::write(path, raw);
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-struct Links {
-    #[serde(default)]
-    tg: HashMap<i64, i64>,
-    #[serde(default)]
-    max: HashMap<i64, i64>,
-}
-
-fn load_links(path: &std::path::Path) -> Links {
-    let Ok(raw) = fs::read_to_string(path) else {
-        return Links::default();
-    };
-    serde_json::from_str(&raw).unwrap_or_default()
-}
-
-fn save_links(path: &std::path::Path, links: &Links) {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(raw) = serde_json::to_string(links) {
-        let _ = fs::write(path, raw);
-    }
-}
-
 fn remember_link(links: &mut Links, tg_message: i64, max_message: i64) {
     links.tg.insert(tg_message, max_message);
     links.max.insert(max_message, tg_message);
 }
 
-fn load_seen(path: &std::path::Path) -> HashMap<i64, Cursor> {
-    let Ok(raw) = fs::read_to_string(path) else {
-        return HashMap::new();
-    };
-    serde_json::from_str(&raw).unwrap_or_default()
+fn remember_outbound(
+    receipts: &mut Receipts,
+    store: &Store,
+    max_message: i64,
+    tg_chat: i64,
+    tg_message: i64,
+    max_chat: i64,
+    time: i64,
+) {
+    receipts.out.insert(
+        max_message,
+        OutReceipt {
+            tg_chat,
+            tg_message,
+            max_chat,
+            time,
+            status: ReceiptStatus::Sent,
+        },
+    );
+    store.save_receipts(receipts);
 }
 
-fn save_seen(path: &std::path::Path, seen: &HashMap<i64, Cursor>) {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+fn remember_inbound(
+    receipts: &mut Receipts,
+    store: &Store,
+    tg_message: i64,
+    max_chat: i64,
+    max_message: i64,
+    time: i64,
+) {
+    receipts.inbound.insert(
+        tg_message,
+        InReceipt {
+            max_chat,
+            max_message,
+            time,
+        },
+    );
+    store.save_receipts(receipts);
+}
+
+fn raise_out_status(receipt: &mut OutReceipt, next: ReceiptStatus) -> bool {
+    if next <= receipt.status {
+        return false;
     }
-    if let Ok(raw) = serde_json::to_string(seen) {
-        let _ = fs::write(path, raw);
+    receipt.status = next;
+    true
+}
+
+fn status_emoji(status: ReceiptStatus) -> &'static str {
+    match status {
+        ReceiptStatus::Sent => REACT_SENT,
+        ReceiptStatus::Arrived => REACT_ARRIVED,
+        ReceiptStatus::Read => REACT_READ,
     }
 }
 
-fn load_map(path: &std::path::Path) -> HashMap<i64, i64> {
-    let Ok(raw) = fs::read_to_string(path) else {
-        return HashMap::new();
-    };
-    serde_json::from_str(&raw).unwrap_or_default()
-}
-
-fn save_map(path: &std::path::Path, map: &HashMap<i64, i64>) {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(raw) = serde_json::to_string(map) {
-        let _ = fs::write(path, raw);
-    }
-}
-
-fn load_offset(path: &std::path::Path) -> i64 {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| raw.trim().parse().ok())
-        .unwrap_or(0)
-}
-
-fn save_offset(path: &std::path::Path, offset: i64) {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = fs::write(path, offset.to_string());
+fn pending_out_chats(receipts: &Receipts) -> Vec<i64> {
+    let mut chats: Vec<i64> = receipts
+        .out
+        .values()
+        .filter(|item| item.status < ReceiptStatus::Read)
+        .map(|item| item.max_chat)
+        .collect();
+    chats.sort_unstable();
+    chats.dedup();
+    chats
 }
 
 #[cfg(test)]
@@ -3664,6 +4133,7 @@ mod tests {
             cid: None,
             reply_to: None,
             forward: None,
+            control: None,
             time: 0,
             media: Vec::new(),
         };
@@ -3676,6 +4146,7 @@ mod tests {
             cid: None,
             reply_to: None,
             forward: None,
+            control: None,
             time: 0,
             media: Vec::new(),
         };
@@ -3807,6 +4278,77 @@ mod tests {
     }
 
     #[test]
+    fn outbound_status_only_moves_forward() {
+        let mut receipt = OutReceipt {
+            tg_chat: 1,
+            tg_message: 2,
+            max_chat: 3,
+            time: 10,
+            status: ReceiptStatus::Sent,
+        };
+        assert!(raise_out_status(&mut receipt, ReceiptStatus::Arrived));
+        assert_eq!(receipt.status, ReceiptStatus::Arrived);
+        assert!(!raise_out_status(&mut receipt, ReceiptStatus::Sent));
+        assert!(raise_out_status(&mut receipt, ReceiptStatus::Read));
+        assert_eq!(status_emoji(receipt.status), REACT_READ);
+    }
+
+    #[test]
+    fn pending_out_chats_skip_read_receipts() {
+        let mut receipts = Receipts::default();
+        receipts.out.insert(
+            1,
+            OutReceipt {
+                tg_chat: 9,
+                tg_message: 1,
+                max_chat: 55,
+                time: 10,
+                status: ReceiptStatus::Sent,
+            },
+        );
+        receipts.out.insert(
+            2,
+            OutReceipt {
+                tg_chat: 9,
+                tg_message: 2,
+                max_chat: 55,
+                time: 20,
+                status: ReceiptStatus::Read,
+            },
+        );
+        receipts.out.insert(
+            3,
+            OutReceipt {
+                tg_chat: 9,
+                tg_message: 3,
+                max_chat: 77,
+                time: 30,
+                status: ReceiptStatus::Arrived,
+            },
+        );
+        assert_eq!(pending_out_chats(&receipts), vec![55, 77]);
+    }
+
+    #[test]
+    fn inbound_receipt_maps_tg_to_max() {
+        let dir = std::env::temp_dir().join(format!(
+            "bridge-receipts-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(dir.join("max.db")).unwrap();
+        let mut receipts = Receipts::default();
+        remember_inbound(&mut receipts, &store, 8, 55, 42, 100);
+        let loaded = store.load_receipts();
+        assert_eq!(loaded.inbound.get(&8).map(|item| item.max_message), Some(42));
+        assert_eq!(loaded.inbound.get(&8).map(|item| item.max_chat), Some(55));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn topic_map_finds_the_max_chat() {
         let mut topics = HashMap::new();
         topics.insert(
@@ -3928,6 +4470,7 @@ mod tests {
             cid: None,
             reply_to: None,
             forward: None,
+            control: None,
             time,
             media: Vec::new(),
         }
@@ -3986,6 +4529,7 @@ mod tests {
             history_chat_ids(&[0, 2], &seen, &topics, 7),
             vec![0, 2, 4, 9]
         );
+        assert_eq!(history_topic_ids(&[0, 2, 4, 9], &[9, 15]), vec![0, 2, 4, 9, 15]);
         let mut bare = sample(1, 10);
         bare.chat_id = None;
         let mut stamped = vec![bare];
@@ -4123,6 +4667,7 @@ mod tests {
             cid: None,
             reply_to: None,
             forward: None,
+            control: None,
             time: 1,
             media: Vec::new(),
         };
@@ -4133,6 +4678,18 @@ mod tests {
             ..removed
         };
         assert_eq!(history_body(&file), text::NOT_FORWARDED);
+        let created = Message {
+            text: String::new(),
+            control: Some(max_client::ControlAttach {
+                event: Some("new".into()),
+                action: None,
+                title: Some("Систэрс".into()),
+                chat_type: Some("CHAT".into()),
+            }),
+            ..file
+        };
+        assert_eq!(history_body(&created), text::chat_created("Систэрс"));
+        assert!(system_body(&created).is_some());
     }
 
     #[test]
@@ -4147,10 +4704,17 @@ mod tests {
         let connecting = panel_markup(LinkState::Connecting);
         assert!(connecting["inline_keyboard"].as_array().unwrap().is_empty());
         let ready = panel_markup(LinkState::Ready);
-        assert_eq!(ready["inline_keyboard"][0][0]["callback_data"], "history");
-        assert_eq!(ready["inline_keyboard"][1][0]["callback_data"], "reread");
-        assert_eq!(ready["inline_keyboard"][2][0]["callback_data"], "logout");
-        assert!(!ready.to_string().contains("127.0.0.1"));
+        assert_eq!(ready["inline_keyboard"][0][0]["text"], text::ADD_CONTACT);
+        assert_eq!(
+            ready["inline_keyboard"][0][0]["web_app"]["url"],
+            auth_http::CONTACTS_URL
+        );
+        assert!(ready["inline_keyboard"][0][0].get("callback_data").is_none());
+        assert_eq!(ready["inline_keyboard"][1][0]["callback_data"], "history");
+        assert_eq!(ready["inline_keyboard"][2][0]["callback_data"], "reread");
+        assert_eq!(ready["inline_keyboard"][3][0]["callback_data"], "logout");
+        assert!(!off.to_string().contains("web_app"));
+        assert!(!connecting.to_string().contains("web_app"));
         assert_eq!(command_list(LinkState::Off)[0]["command"], "setup");
         assert_eq!(command_list(LinkState::Ready)[2]["command"], "logout");
         assert!(command_list(LinkState::Connecting)

@@ -15,8 +15,12 @@ pub const AUTH_REQUEST: i64 = 17;
 pub const AUTH: i64 = 18;
 pub const LOGIN: i64 = 19;
 pub const CONTACT_INFO: i64 = 32;
+#[allow(dead_code)]
+pub const CONTACT_LIST: i64 = 36;
+pub const CONTACT_ADD_BY_PHONE: i64 = 41;
 pub const CHAT_INFO: i64 = 48;
 pub const CHAT_HISTORY: i64 = 49;
+pub const CHAT_MARK: i64 = 50;
 pub const CHATS_LIST: i64 = 53;
 pub const MSG_SEND: i64 = 64;
 pub const PHOTO_UPLOAD: i64 = 80;
@@ -24,7 +28,9 @@ pub const VIDEO_UPLOAD: i64 = 82;
 pub const VIDEO_PLAY: i64 = 83;
 pub const AUTH_LOGIN_CHECK_PASSWORD: i64 = 115;
 pub const NOTIF_MESSAGE: i64 = 128;
+pub const NOTIF_MARK: i64 = 130;
 pub const NOTIF_ATTACH: i64 = 136;
+pub const MSG_DELIVERY: i64 = 303;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Frame {
@@ -45,6 +51,7 @@ pub fn request(seq: i64, opcode: i64, payload: Value) -> Frame {
     }
 }
 
+#[cfg(test)]
 pub fn encode(frame: &Frame) -> Result<String> {
     Ok(serde_json::to_string(frame)?)
 }
@@ -135,6 +142,8 @@ fn json_to_msgpack(value: &Value) -> rmpv::Value {
                         wave_bytes(item).unwrap_or_else(|| json_to_msgpack(item))
                     } else if key == "mode" {
                         mode_bytes(item).unwrap_or_else(|| json_to_msgpack(item))
+                    } else if key == "chatsCountGroups" {
+                        group_count_bytes(item).unwrap_or_else(|| json_to_msgpack(item))
                     } else {
                         json_to_msgpack(item)
                     };
@@ -151,6 +160,11 @@ fn wave_bytes(value: &Value) -> Option<rmpv::Value> {
 
 fn mode_bytes(value: &Value) -> Option<rmpv::Value> {
     binary_field(value, 96)
+}
+
+fn group_count_bytes(value: &Value) -> Option<rmpv::Value> {
+    // PyMax sends bytearray.fromhex("0a32") inside exp.chatsCountGroups.
+    binary_field(value, 2)
 }
 
 fn binary_field(value: &Value, len: usize) -> Option<rmpv::Value> {
@@ -210,6 +224,7 @@ fn msgpack_to_json(value: rmpv::Value) -> Value {
     }
 }
 
+#[cfg(test)]
 pub fn decode(raw: &str) -> Result<Frame> {
     let value: Value = serde_json::from_str(raw)?;
     let obj = value

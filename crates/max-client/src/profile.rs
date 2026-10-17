@@ -1,3 +1,6 @@
+// Chrome/home session extract stays for tests and recovery; the bridge signs in via the web page.
+#![allow(dead_code)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -63,50 +66,13 @@ impl std::fmt::Debug for Session {
     }
 }
 
-pub fn load_or_extract(session_path: &Path, home: &Path) -> Result<Session> {
-    if let Some(session) = read_session(session_path)? {
+pub fn load_or_extract(store: &crate::store::Store, home: &Path) -> Result<Session> {
+    if let Some(session) = store.read_session()? {
         return Ok(session);
     }
     let session = extract_from_home(home)?;
-    write_session(session_path, &session)?;
+    store.write_session(&session)?;
     Ok(session)
-}
-
-pub fn read_session(path: &Path) -> Result<Option<Session>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw = fs::read_to_string(path)?;
-    let session: Session = serde_json::from_str(&raw)?;
-    if session.token.is_empty() || session.device_id.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(session))
-}
-
-pub fn write_session(path: &Path, session: &Session) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let raw = serde_json::to_string_pretty(session)?;
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, raw)?;
-    restrict(&tmp);
-    fs::rename(&tmp, path)?;
-    restrict(path);
-    Ok(())
-}
-
-fn restrict(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
 }
 
 pub fn extract_from_home(home: &Path) -> Result<Session> {

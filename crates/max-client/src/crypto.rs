@@ -1,3 +1,6 @@
+// Used by profile session extract and unit tests; the bridge signs in via the web page.
+#![allow(dead_code)]
+
 use aes::Aes128;
 use base64::Engine;
 use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};

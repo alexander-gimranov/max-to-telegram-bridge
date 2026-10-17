@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -15,18 +14,21 @@ use tokio_rustls::TlsConnector;
 use crate::error::{Error, Result};
 use crate::frame::{
     decode_bin, encode_bin, json_i64, payload_error, request, AUTH, AUTH_LOGIN_CHECK_PASSWORD,
-    AUTH_REQUEST, CHAT_HISTORY, CHAT_INFO, CHATS_LIST, CMD_ERROR, CMD_EVENT, CONTACT_INFO, LOGIN,
-    MSG_SEND, NOTIF_ATTACH, NOTIF_MESSAGE, PHOTO_UPLOAD, PING, SESSION_INIT, VIDEO_PLAY,
-    VIDEO_UPLOAD,
+    AUTH_REQUEST, CHAT_HISTORY, CHAT_INFO, CHAT_MARK, CHATS_LIST, CMD_ERROR, CMD_EVENT,
+    CONTACT_ADD_BY_PHONE, CONTACT_INFO, LOGIN, MSG_DELIVERY, MSG_SEND, NOTIF_ATTACH, NOTIF_MARK,
+    NOTIF_MESSAGE, PHOTO_UPLOAD, PING, SESSION_INIT, VIDEO_PLAY, VIDEO_UPLOAD,
 };
 use crate::models::{
-    ack_payload, auth_code_payload, auth_mode, auth_password_payload, auth_request_payload,
-    history_payload, login_payload, me_id, mobile_handshake_payload, parse_chats,
-    parse_code_challenge, parse_code_status, parse_login_token, parse_message, parse_messages,
-    parse_users, send_payload, sync_time, Attach, Chat, ChatFace, CodeChallenge, CodeStatus,
-    Message, Name, User, VoiceTicket,
+    ack_payload, add_contact_payload, auth_code_payload, auth_mode, auth_password_payload,
+    auth_request_payload, history_payload, login_payload, mark_read_payload, me_id,
+    mobile_handshake_payload, parse_added_contact, parse_book, parse_chats, parse_code_challenge,
+    parse_code_status, parse_delivery_mark, parse_login_token, parse_message, parse_messages,
+    parse_read_mark, parse_users, send_payload, split_contact_name, sync_time, AddedContact, Attach,
+    Chat, ChatFace, CodeChallenge, CodeStatus, DeliveryMark, Message, Name, ReadMark, User,
+    VoiceTicket,
 };
-use crate::profile::{self, Session};
+use crate::profile::Session;
+use crate::store::Store;
 use crate::voice_tcp::VoiceLink;
 
 const QUIET_FOR: Duration = Duration::from_secs(60);
@@ -58,7 +60,10 @@ fn now_secs() -> u64 {
 pub enum Event {
     Ready { me: i64 },
     Message(Message),
+    Delivered(DeliveryMark),
+    Read(ReadMark),
     Logged { note: String },
+    Contact { dialog: i64, name: String },
 }
 
 enum Cmd {
@@ -104,11 +109,30 @@ enum Cmd {
     ChatIds {
         reply: oneshot::Sender<Vec<i64>>,
     },
+    QuietDialogs {
+        reply: oneshot::Sender<Result<Vec<i64>>>,
+    },
     VideoPlay {
         chat_id: i64,
         message_id: i64,
         video_id: i64,
         reply: oneshot::Sender<Result<String>>,
+    },
+    AddContact {
+        phone: String,
+        first_name: String,
+        last_name: String,
+        reply: oneshot::Sender<Result<AddedContact>>,
+    },
+    MarkRead {
+        chat_id: i64,
+        message_id: i64,
+        mark: i64,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    ChatPeerMarks {
+        chat_id: i64,
+        reply: oneshot::Sender<Result<HashMap<i64, i64>>>,
     },
 }
 
@@ -121,8 +145,8 @@ pub struct Client {
 }
 
 impl Client {
-    pub async fn start(session_path: PathBuf) -> Result<Self> {
-        let session = profile::read_session(&session_path)?.ok_or(Error::SessionNotFound)?;
+    pub async fn start(store: Arc<Store>) -> Result<Self> {
+        let session = store.read_session()?.ok_or(Error::SessionNotFound)?;
         let saved = session.clone();
         let voice_hold = Arc::new(AtomicBool::new(false));
         let voice_cids = Arc::new(Mutex::new(Vec::new()));
@@ -132,7 +156,7 @@ impl Client {
         let cids = Arc::clone(&voice_cids);
         tokio::spawn(async move {
             if let Err(err) =
-                run_forever(session, session_path, cmd_rx, event_tx.clone(), hold, cids).await
+                run_forever(session, store, cmd_rx, event_tx.clone(), hold, cids).await
             {
                 let note = Event::Logged {
                     note: err.to_string(),
@@ -288,6 +312,12 @@ impl Client {
         wait_cmd(rx).await
     }
 
+    pub async fn quiet_dialog_ids(&self) -> Result<Vec<i64>> {
+        let (reply, rx) = oneshot::channel();
+        send_cmd(&self.cmd_tx, Cmd::QuietDialogs { reply }).await?;
+        wait_cmd(rx).await?
+    }
+
     pub async fn video_play_url(
         &self,
         chat_id: i64,
@@ -301,6 +331,58 @@ impl Client {
                 chat_id,
                 message_id,
                 video_id,
+                reply,
+            },
+        )
+        .await?;
+        wait_cmd(rx).await?
+    }
+
+    pub async fn mark_read(&self, chat_id: i64, message_id: i64, mark: i64) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        send_cmd(
+            &self.cmd_tx,
+            Cmd::MarkRead {
+                chat_id,
+                message_id,
+                mark,
+                reply,
+            },
+        )
+        .await?;
+        wait_cmd(rx).await?
+    }
+
+    pub async fn chat_peer_marks(&self, chat_id: i64) -> Result<HashMap<i64, i64>> {
+        let (reply, rx) = oneshot::channel();
+        send_cmd(&self.cmd_tx, Cmd::ChatPeerMarks { chat_id, reply }).await?;
+        wait_cmd(rx).await?
+    }
+}
+
+#[derive(Clone)]
+pub struct SessionLink {
+    cmd_tx: mpsc::Sender<Cmd>,
+}
+
+impl Client {
+    pub fn link(&self) -> SessionLink {
+        SessionLink {
+            cmd_tx: self.cmd_tx.clone(),
+        }
+    }
+}
+
+impl SessionLink {
+    pub async fn add_contact(&self, phone: &str, name: &str) -> Result<AddedContact> {
+        let (first_name, last_name) = split_contact_name(name);
+        let (reply, rx) = oneshot::channel();
+        send_cmd(
+            &self.cmd_tx,
+            Cmd::AddContact {
+                phone: phone.to_owned(),
+                first_name,
+                last_name,
                 reply,
             },
         )
@@ -512,7 +594,7 @@ fn session_id(device_id: &str) -> i64 {
 
 async fn run_forever(
     mut session: Session,
-    session_path: PathBuf,
+    store: Arc<Store>,
     mut cmd_rx: mpsc::Receiver<Cmd>,
     event_tx: mpsc::Sender<Event>,
     voice_hold: Arc<AtomicBool>,
@@ -524,7 +606,7 @@ async fn run_forever(
         beat();
         match run_once(
             &mut session,
-            &session_path,
+            &store,
             &mut cmd_rx,
             &event_tx,
             &voice_cids,
@@ -535,7 +617,7 @@ async fn run_forever(
             Ok(()) => attempt = 0,
             Err(err) => {
                 if credential_rejected(&err) {
-                    let _ = std::fs::remove_file(&session_path);
+                    let _ = store.clear_session();
                     return Err(Error::Protocol(
                         "saved MAX session was rejected. Run the program again and sign in".into(),
                     ));
@@ -598,7 +680,7 @@ enum Waiter {
 
 async fn run_once(
     session: &mut Session,
-    session_path: &std::path::Path,
+    store: &Store,
     cmd_rx: &mut mpsc::Receiver<Cmd>,
     event_tx: &mpsc::Sender<Event>,
     voice_cids: &Mutex<Vec<i64>>,
@@ -633,10 +715,10 @@ async fn run_once(
         LOGIN,
         login_payload(
             &session.token,
-            session.chats_sync,
-            session.contacts_sync,
-            session.drafts_sync,
-            session.presence_sync,
+            -1,
+            -1,
+            -1,
+            -1,
             session.desktop,
         ),
         event_tx,
@@ -657,19 +739,53 @@ async fn run_once(
         session.drafts_sync = time;
         session.presence_sync = time;
     }
-    let _ = profile::write_session(session_path, session);
+    let _ = store.write_session(session);
 
-    let names_file = names_path(session_path);
     let mut chats: HashMap<i64, Chat> = parse_chats(&logged)
         .into_iter()
         .map(|chat| (chat.id, chat))
         .collect();
     let mut users = HashMap::new();
-    apply_name_cache(&mut users, &load_name_cache(&names_file));
-    for user in parse_users(&logged) {
+    apply_name_cache(&mut users, &store.load_names().unwrap_or_default());
+    let mut contact_ids = store.load_contacts().unwrap_or_default();
+    for user in parse_book(&logged) {
+        contact_ids.insert(user.id);
         remember_user(&mut users, user);
     }
-    save_name_cache(&names_file, &users);
+    let _ = store.save_contacts(&contact_ids);
+    let _ = store.merge_names_from_users(&users);
+    let raw_contacts = match logged.get("contacts") {
+        None => "missing".to_owned(),
+        Some(value) => value_brief(value),
+    };
+    let chat_marker = json_i64(logged.get("chatMarker"))
+        .or_else(|| json_i64(logged.get("marker")));
+    let login_shape = logged
+        .as_object()
+        .map(|obj| {
+            let mut keys: Vec<_> = obj
+                .iter()
+                .map(|(key, value)| format!("{key}:{}", value_brief(value)))
+                .collect();
+            keys.sort();
+            keys.join(" ")
+        })
+        .unwrap_or_else(|| "none".into());
+    push_event(
+        event_tx,
+        queued,
+        Event::Logged {
+            note: format!(
+                "login chats {} contacts {} raw {} marker {} {login_shape}",
+                chats.len(),
+                contact_ids.len(),
+                raw_contacts,
+                chat_marker
+                    .map(|marker| marker.to_string())
+                    .unwrap_or_else(|| "none".into())
+            ),
+        },
+    );
     if let Ok(fresh) = roundtrip(
         &mut link,
         &mut pending,
@@ -730,7 +846,7 @@ async fn run_once(
                             &frame.payload,
                             &mut chats,
                             &mut users,
-                            &names_file,
+                            store,
                         );
                         continue;
                     }
@@ -750,6 +866,14 @@ async fn run_once(
                             continue;
                         }
                         let _ = event_tx.try_send(Event::Message(message));
+                    }
+                } else if frame.opcode == NOTIF_MARK {
+                    if let Some(mark) = parse_read_mark(&frame.payload) {
+                        let _ = event_tx.try_send(Event::Read(mark));
+                    }
+                } else if frame.opcode == MSG_DELIVERY {
+                    if let Some(mark) = parse_delivery_mark(&frame.payload) {
+                        let _ = event_tx.try_send(Event::Delivered(mark));
                     }
                 }
             }
@@ -815,7 +939,7 @@ async fn run_once(
                             event_tx,
                             &mut chats,
                             &mut users,
-                            &names_file,
+                            store,
                             me,
                             chat_id,
                         )
@@ -823,7 +947,8 @@ async fn run_once(
                         let _ = reply.send(photo);
                     }
                     Cmd::ChatFace { chat_id, reply } => {
-                        if chats.contains_key(&chat_id) {
+                        if chats.contains_key(&chat_id) || cached_contact(&users, me, chat_id).is_some()
+                        {
                             let _ = reply.send(chat_face(&chats, &users, me, chat_id));
                         } else {
                             let _ = send_frame(
@@ -911,6 +1036,10 @@ async fn run_once(
                         fill_chats(&mut link, &mut pending, &mut voices, &mut chats, event_tx).await;
                         let _ = reply.send(known_chats(&chats));
                     }
+                    Cmd::QuietDialogs { reply } => {
+                        let ids: Vec<i64> = contact_ids.iter().copied().collect();
+                        let _ = reply.send(Ok(unstarted_dialogs(&chats, &ids, me)));
+                    }
                     Cmd::VideoPlay {
                         chat_id,
                         message_id,
@@ -934,6 +1063,90 @@ async fn run_once(
                             Ok(payload) => video_play_url(&payload).ok_or_else(|| {
                                 Error::Protocol("MAX video play did not return a url".into())
                             }),
+                            Err(err) => Err(err),
+                        };
+                        let _ = reply.send(result);
+                    }
+                    Cmd::AddContact {
+                        phone,
+                        first_name,
+                        last_name,
+                        reply,
+                    } => {
+                        let result = match roundtrip(
+                            &mut link,
+                            &mut pending,
+                            &mut voices,
+                            CONTACT_ADD_BY_PHONE,
+                            add_contact_payload(&phone, &first_name, &last_name),
+                            event_tx,
+                        )
+                        .await
+                        {
+                            Ok(payload) => match parse_added_contact(&payload) {
+                                Ok(added) => {
+                                    contact_ids.insert(added.id);
+                                    let _ = store.save_contacts(&contact_ids);
+                                    let named = noted_contact(&added, &first_name, &last_name);
+                                    let name = named
+                                        .as_ref()
+                                        .map(|user| user.display_name())
+                                        .unwrap_or_default();
+                                    if let Some(user) = named {
+                                        remember_user(&mut users, user);
+                                        let _ = store.merge_names_from_users(&users);
+                                    }
+                                    let dialog = dialog_id(me, added.id);
+                                    if dialog != 0 && !name.is_empty() {
+                                        push_event(
+                                            event_tx,
+                                            queued,
+                                            Event::Contact { dialog, name },
+                                        );
+                                    }
+                                    Ok(added)
+                                }
+                                Err(err) => Err(err),
+                            },
+                            Err(err) => Err(err),
+                        };
+                        let _ = reply.send(result);
+                    }
+                    Cmd::MarkRead {
+                        chat_id,
+                        message_id,
+                        mark,
+                        reply,
+                    } => {
+                        let result = roundtrip(
+                            &mut link,
+                            &mut pending,
+                            &mut voices,
+                            CHAT_MARK,
+                            mark_read_payload(chat_id, message_id, mark),
+                            event_tx,
+                        )
+                        .await
+                        .map(|_| ());
+                        let _ = reply.send(result);
+                    }
+                    Cmd::ChatPeerMarks { chat_id, reply } => {
+                        let result = match roundtrip(
+                            &mut link,
+                            &mut pending,
+                            &mut voices,
+                            CHAT_INFO,
+                            json!({"chatIds": [chat_id]}),
+                            event_tx,
+                        )
+                        .await
+                        {
+                            Ok(payload) => {
+                                for chat in parse_chats(&payload) {
+                                    remember_chat(&mut chats, chat);
+                                }
+                                Ok(cached_peer_marks(&chats, chat_id))
+                            }
                             Err(err) => Err(err),
                         };
                         let _ = reply.send(result);
@@ -1012,12 +1225,65 @@ fn next_chat_marker(
     if !seen_pages.insert(fingerprint) {
         return None;
     }
-    let next = json_i64(payload.get("marker"))?;
+    let next = json_i64(payload.get("chatMarker")).or_else(|| json_i64(payload.get("marker")))?;
     if next == marker {
         None
     } else {
         Some(next)
     }
+}
+
+fn value_brief(value: &Value) -> String {
+    match value {
+        Value::Array(items) => format!("array {}", items.len()),
+        Value::Object(map) => format!("object {}", map.len()),
+        Value::Null => "null".into(),
+        Value::Bool(flag) => format!("bool {flag}"),
+        Value::Number(_) => "number".into(),
+        Value::String(text) => format!("string {}", text.len()),
+    }
+}
+
+fn dialog_id(me: i64, contact: i64) -> i64 {
+    // A personal dialog keeps this id before the first message.
+    me ^ contact
+}
+
+fn unstarted_dialogs(chats: &HashMap<i64, Chat>, contacts: &[i64], me: i64) -> Vec<i64> {
+    let mut peers = HashSet::new();
+    for chat in chats.values() {
+        if chat.id == 0 || is_group(chat) {
+            continue;
+        }
+        for peer in &chat.peers {
+            if *peer != me {
+                peers.insert(*peer);
+            }
+        }
+    }
+    let mut ids = Vec::new();
+    for contact in contacts {
+        if *contact == me || *contact == 0 || peers.contains(contact) {
+            continue;
+        }
+        let dialog = dialog_id(me, *contact);
+        if dialog == 0 || chats.contains_key(&dialog) || ids.contains(&dialog) {
+            continue;
+        }
+        ids.push(dialog);
+    }
+    ids.sort_unstable();
+    ids
+}
+
+fn cached_contact<'a>(
+    users: &'a HashMap<i64, User>,
+    me: i64,
+    chat_id: i64,
+) -> Option<&'a User> {
+    users
+        .get(&dialog_id(me, chat_id))
+        .or_else(|| users.get(&chat_id))
 }
 
 fn known_chats(chats: &HashMap<i64, Chat>) -> Vec<i64> {
@@ -1106,6 +1372,13 @@ fn voice_ticket(payload: &Value) -> Result<VoiceTicket> {
     })
 }
 
+fn cached_peer_marks(chats: &HashMap<i64, Chat>, chat_id: i64) -> HashMap<i64, i64> {
+    chats
+        .get(&chat_id)
+        .map(|chat| chat.peer_marks.clone())
+        .unwrap_or_default()
+}
+
 fn cached_title(chats: &HashMap<i64, Chat>, chat_id: i64) -> Option<String> {
     let title = chats.get(&chat_id)?.title.clone()?;
     if title.is_empty() {
@@ -1121,67 +1394,6 @@ fn cached_name(users: &HashMap<i64, User>, user_id: i64) -> Option<String> {
         None
     } else {
         Some(name)
-    }
-}
-
-fn names_path(session_path: &Path) -> PathBuf {
-    session_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("names.json")
-}
-
-fn load_name_cache(path: &Path) -> HashMap<i64, String> {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return HashMap::new();
-    };
-    serde_json::from_str(&raw).unwrap_or_default()
-}
-
-fn save_name_cache(path: &Path, users: &HashMap<i64, User>) {
-    let mut names = load_name_cache(path);
-    let mut changed = false;
-    for user in users.values() {
-        let name = user.display_name();
-        if name.is_empty() {
-            continue;
-        }
-        if names.get(&user.id).map(String::as_str) != Some(name.as_str()) {
-            names.insert(user.id, name);
-            changed = true;
-        }
-    }
-    if !changed && path.exists() {
-        return;
-    }
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let Ok(raw) = serde_json::to_string(&names) else {
-        return;
-    };
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, raw).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return;
-    }
-    restrict_file(&tmp);
-    if std::fs::rename(&tmp, path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return;
-    }
-    restrict_file(path);
-}
-
-fn restrict_file(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
     }
 }
 
@@ -1216,6 +1428,27 @@ fn name_text(item: &Name) -> String {
     let first = item.first_name.as_deref().unwrap_or("");
     let last = item.last_name.as_deref().unwrap_or("");
     format!("{first} {last}").trim().to_owned()
+}
+
+fn noted_contact(added: &AddedContact, first_name: &str, last_name: &str) -> Option<User> {
+    let mut user = added.user.clone().unwrap_or(User {
+        id: added.id,
+        names: Vec::new(),
+        photo: None,
+    });
+    if user.display_name().is_empty() {
+        let name = format!("{first_name} {last_name}").trim().to_owned();
+        if name.is_empty() {
+            return None;
+        }
+        user.names.push(Name {
+            name: Some(name),
+            first_name: (!first_name.is_empty()).then(|| first_name.to_owned()),
+            last_name: (!last_name.is_empty()).then(|| last_name.to_owned()),
+            kind: "CUSTOM".into(),
+        });
+    }
+    Some(user)
 }
 
 fn remember_user(users: &mut HashMap<i64, User>, mut user: User) {
@@ -1274,12 +1507,17 @@ async fn lookup_chat_photo(
     event_tx: &mpsc::Sender<Event>,
     chats: &mut HashMap<i64, Chat>,
     users: &mut HashMap<i64, User>,
-    names_file: &Path,
+    store: &Store,
     me: i64,
     chat_id: i64,
 ) -> std::result::Result<Option<String>, ()> {
     if chat_id == 0 {
         return Ok(None);
+    }
+    if !chats.contains_key(&chat_id) {
+        if let Some(user) = cached_contact(users, me, chat_id) {
+            return Ok(clean_photo(user.photo.clone()));
+        }
     }
     if !chats.contains_key(&chat_id) {
         let payload = roundtrip(
@@ -1325,7 +1563,7 @@ async fn lookup_chat_photo(
     for user in parse_users(&payload) {
         remember_user(users, user);
     }
-    save_name_cache(names_file, users);
+    let _ = store.merge_names_from_users(users);
     Ok(stored_chat_photo(&chat, users, me))
 }
 
@@ -1347,7 +1585,14 @@ fn chat_face(
     chat_id: i64,
 ) -> ChatFace {
     let Some(chat) = chats.get(&chat_id) else {
-        return ChatFace::default();
+        let label = cached_contact(users, me, chat_id)
+            .map(|user| user.display_name())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_default();
+        return ChatFace {
+            label,
+            group: false,
+        };
     };
     if is_group(chat) {
         return ChatFace {
@@ -1386,7 +1631,7 @@ fn finish_waiter(
     payload: &Value,
     chats: &mut HashMap<i64, Chat>,
     users: &mut HashMap<i64, User>,
-    names_path: &Path,
+    store: &Store,
 ) {
     let failed = if *cmd == CMD_ERROR {
         Some(payload_error(payload).unwrap_or_else(|| "MAX rejected the request".into()))
@@ -1424,7 +1669,7 @@ fn finish_waiter(
                 for user in parse_users(payload) {
                     remember_user(users, user);
                 }
-                save_name_cache(names_path, users);
+                let _ = store.merge_names_from_users(users);
             }
             let name = cached_name(users, user_id).unwrap_or_default();
             let _ = reply.send(name);
@@ -1612,6 +1857,14 @@ async fn roundtrip(
                     let _ = event_tx.try_send(Event::Message(message));
                 }
             }
+        } else if frame.opcode == NOTIF_MARK {
+            if let Some(mark) = parse_read_mark(&frame.payload) {
+                let _ = event_tx.try_send(Event::Read(mark));
+            }
+        } else if frame.opcode == MSG_DELIVERY {
+            if let Some(mark) = parse_delivery_mark(&frame.payload) {
+                let _ = event_tx.try_send(Event::Delivered(mark));
+            }
         }
     }
 }
@@ -1637,10 +1890,14 @@ async fn connect() -> Result<Link> {
     })
 }
 
-pub(crate) fn tls_config() -> ClientConfig {
+pub fn install_tls_provider() {
     // reqwest links the aws-lc provider and this crate links ring. rustls
     // refuses to guess when both are present.
     let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+pub(crate) fn tls_config() -> ClientConfig {
+    install_tls_provider();
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     // api2.oneme.ru sends only the leaf. Its issuer is absent from the Mozilla set,
@@ -1725,12 +1982,12 @@ mod tests {
     fn name_cache_survives_a_reload() {
         let dir = std::env::temp_dir().join(format!("max-names-{}", now_ms()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("names.json");
+        let store = Store::open(dir.join("max.db")).unwrap();
         let mut users = HashMap::new();
         users.insert(7, remembered_user(7, "Маня Н"));
-        save_name_cache(&path, &users);
+        store.merge_names_from_users(&users).unwrap();
         let mut again = HashMap::new();
-        apply_name_cache(&mut again, &load_name_cache(&path));
+        apply_name_cache(&mut again, &store.load_names().unwrap());
         assert_eq!(cached_name(&again, 7).as_deref(), Some("Маня Н"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1745,6 +2002,7 @@ mod tests {
                 title: None,
                 kind: "DIALOG".into(),
                 peers: vec![5, 8],
+                peer_marks: HashMap::new(),
                 photo: None,
             },
         );
@@ -1753,6 +2011,67 @@ mod tests {
         let face = chat_face(&chats, &users, 5, 9);
         assert_eq!(face.label, "Маня Н");
         assert!(!face.group);
+        let quiet = dialog_id(5, 8);
+        assert_eq!(quiet, 5 ^ 8);
+        let synced = login_payload("t", 4, 0, 1, 2, false);
+        assert_eq!(synced["contactsSync"], 0);
+        assert_eq!(synced["chatsSync"], 4);
+        assert_eq!(
+            chat_face(&HashMap::new(), &users, 5, quiet).label,
+            "Маня Н"
+        );
+        assert_eq!(
+            unstarted_dialogs(&chats, &[8, 5, 20], 5),
+            vec![dialog_id(5, 20)]
+        );
+        let mut grouped = chats.clone();
+        grouped.insert(
+            30,
+            Chat {
+                id: 30,
+                title: Some("Kitchen".into()),
+                kind: "CHAT".into(),
+                peers: vec![5, 20],
+                peer_marks: HashMap::new(),
+                photo: None,
+            },
+        );
+        assert_eq!(
+            unstarted_dialogs(&grouped, &[8, 20], 5),
+            vec![dialog_id(5, 20)]
+        );
+    }
+
+    #[test]
+    fn added_contact_stays_in_the_book() {
+        let added = AddedContact {
+            id: 20,
+            fresh: false,
+            user: None,
+        };
+        let user = noted_contact(&added, "Иван", "Петров").unwrap();
+        assert_eq!(user.display_name(), "Иван Петров");
+        let mut users = HashMap::new();
+        remember_user(&mut users, user);
+        let dialogs = unstarted_dialogs(&HashMap::new(), &[added.id], 5);
+        assert_eq!(dialogs, vec![dialog_id(5, 20)]);
+        assert_eq!(
+            chat_face(&HashMap::new(), &users, 5, dialogs[0]).label,
+            "Иван Петров"
+        );
+        let dir = std::env::temp_dir().join(format!("max-contacts-{}", now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(dir.join("max.db")).unwrap();
+        let mut ids = HashSet::new();
+        ids.insert(added.id);
+        ids.insert(0);
+        store.save_contacts(&ids).unwrap();
+        let loaded = store.load_contacts().unwrap();
+        assert!(loaded.contains(&added.id));
+        assert!(!loaded.contains(&0));
+        let saved: Vec<i64> = loaded.into_iter().collect();
+        assert_eq!(unstarted_dialogs(&HashMap::new(), &saved, 5), dialogs);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1765,6 +2084,7 @@ mod tests {
                 title: Some("Kitchen".into()),
                 kind: "CHAT".into(),
                 peers: vec![5, 8],
+                peer_marks: HashMap::new(),
                 photo: Some("https://i.oneme.ru/i?r=icon".into()),
             },
         );
@@ -1786,6 +2106,7 @@ mod tests {
             title: None,
             kind: "DIALOG".into(),
             peers: vec![5, 8],
+            peer_marks: HashMap::new(),
             photo: Some("https://i.oneme.ru/i?r=chat".into()),
         };
         let mut users = HashMap::new();
@@ -1799,6 +2120,7 @@ mod tests {
             title: None,
             kind: "DIALOG".into(),
             peers: vec![5],
+            peer_marks: HashMap::new(),
             photo: Some("https://i.oneme.ru/i?r=me".into()),
         };
         assert!(stored_chat_photo(&favorites, &users, 5).is_none());

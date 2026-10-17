@@ -12,6 +12,7 @@ futures-util = "0.3"
 lz4_flex = "0.11"
 pbkdf2 = "0.12"
 rmpv = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use base64::Engine;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -30,7 +32,22 @@ pub struct Chat {
     pub title: Option<String>,
     pub kind: String,
     pub peers: Vec<i64>,
+    pub peer_marks: HashMap<i64, i64>,
     pub photo: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReadMark {
+    pub chat_id: i64,
+    pub mark: i64,
+    pub message_ids: Vec<i64>,
+    pub user_id: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeliveryMark {
+    pub chat_id: i64,
+    pub message_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -49,6 +66,7 @@ pub struct Message {
     pub cid: Option<i64>,
     pub reply_to: Option<i64>,
     pub forward: Option<ForwardSource>,
+    pub control: Option<ControlAttach>,
     pub time: i64,
     pub media: Vec<Media>,
 }
@@ -57,6 +75,14 @@ pub struct Message {
 pub struct ForwardSource {
     pub sender: Option<i64>,
     pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlAttach {
+    pub event: Option<String>,
+    pub action: Option<String>,
+    pub title: Option<String>,
+    pub chat_type: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,22 +347,24 @@ pub fn login_payload(
     let mut payload = json!({
         "token": token,
         "interactive": true,
-        "chatsCount": 40,
         "chatsSync": chats_sync,
         "contactsSync": contacts_sync,
         "draftsSync": drafts_sync,
         "presenceSync": presence_sync,
     });
     if desktop {
+        payload["chatsCount"] = json!(40);
         payload["callsSync"] = json!(0);
         payload["bannersSync"] = json!(0);
         payload["configHash"] = json!("");
         payload["lastLogin"] = json!(0);
     } else {
         payload["userAgent"] = mobile_user_agent();
+        // PyMax asks for the full contact snapshot with -1, this hash, and exp.
         payload["configHash"] = json!(
             "00000000-0000000000000000-00000000-0000000000000000-0000000000000000-0-0000000000000000-00000000"
         );
+        payload["exp"] = json!({"chatsCountGroups": "CjI="});
     }
     payload
 }
@@ -459,9 +487,39 @@ pub fn parse_message(payload: &Value) -> Option<Message> {
         cid,
         reply_to: reply_target(body),
         forward: forward_source(body),
+        control: parse_control(body),
         time: json_i64(body.get("time")).unwrap_or(0),
         media,
     })
+}
+
+fn parse_control(body: &serde_json::Map<String, Value>) -> Option<ControlAttach> {
+    let items = body.get("attaches").and_then(Value::as_array)?;
+    for item in items {
+        let obj = item.as_object()?;
+        if attach_kind(obj) != Some("CONTROL") {
+            continue;
+        }
+        return Some(ControlAttach {
+            event: obj
+                .get("event")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            action: obj
+                .get("action")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            title: obj
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            chat_type: obj
+                .get("chatType")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        });
+    }
+    None
 }
 
 fn parse_media(body: &serde_json::Map<String, Value>) -> Vec<Media> {
@@ -660,6 +718,9 @@ fn parse_name(value: &Value) -> Option<Name> {
 
 pub fn parse_chat(value: &Value) -> Option<Chat> {
     let obj = value.as_object()?;
+    let peer_marks = peer_marks(obj.get("participants"));
+    let mut peers: Vec<i64> = peer_marks.keys().copied().collect();
+    peers.sort_unstable();
     Some(Chat {
         id: json_i64(obj.get("id"))?,
         title: obj.get("title").and_then(Value::as_str).map(str::to_owned),
@@ -668,18 +729,92 @@ pub fn parse_chat(value: &Value) -> Option<Chat> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned(),
-        peers: peer_ids(obj.get("participants")),
+        peers,
+        peer_marks,
         photo: first_url(obj, &["baseIconUrl", "baseUrl", "iconUrl"]),
     })
 }
 
-fn peer_ids(value: Option<&Value>) -> Vec<i64> {
+fn peer_marks(value: Option<&Value>) -> HashMap<i64, i64> {
     let Some(map) = value.and_then(Value::as_object) else {
-        return Vec::new();
+        return HashMap::new();
     };
-    let mut ids: Vec<i64> = map.keys().filter_map(|key| key.parse().ok()).collect();
-    ids.sort_unstable();
-    ids
+    let mut out = HashMap::new();
+    for (key, mark) in map {
+        let Ok(id) = key.parse::<i64>() else {
+            continue;
+        };
+        if let Some(mark) = json_i64(Some(mark)) {
+            out.insert(id, mark);
+        } else {
+            out.insert(id, 0);
+        }
+    }
+    out
+}
+
+pub fn mark_read_payload(chat_id: i64, message_id: i64, mark: i64) -> Value {
+    json!({
+        "type": "READ_MESSAGE",
+        "chatId": chat_id,
+        "messageId": message_id.to_string(),
+        "mark": mark,
+    })
+}
+
+pub fn parse_read_mark(payload: &Value) -> Option<ReadMark> {
+    let obj = payload.as_object()?;
+    let chat_id = json_i64(obj.get("chatId"))?;
+    let mark = json_i64(obj.get("mark"))
+        .or_else(|| json_i64(obj.get("readMark")))
+        .or_else(|| json_i64(obj.get("time")))
+        .unwrap_or(0);
+    let message_ids = collect_ids(obj.get("messageIds"))
+        .or_else(|| collect_ids(obj.get("messageId")))
+        .unwrap_or_default();
+    let user_id = json_i64(obj.get("userId"))
+        .or_else(|| json_i64(obj.get("sender")))
+        .or_else(|| json_i64(obj.get("senderId")));
+    Some(ReadMark {
+        chat_id,
+        mark,
+        message_ids,
+        user_id,
+    })
+}
+
+pub fn parse_delivery_mark(payload: &Value) -> Option<DeliveryMark> {
+    let obj = payload.as_object()?;
+    let chat_id = json_i64(obj.get("chatId"))?;
+    let message_ids = collect_ids(obj.get("messageIds"))
+        .or_else(|| collect_ids(obj.get("messageId")))
+        .unwrap_or_default();
+    Some(DeliveryMark {
+        chat_id,
+        message_ids,
+    })
+}
+
+fn collect_ids(value: Option<&Value>) -> Option<Vec<i64>> {
+    let value = value?;
+    if let Some(id) = json_i64(Some(value)) {
+        return Some(vec![id]);
+    }
+    if let Some(text) = value.as_str() {
+        return text.parse().ok().map(|id| vec![id]);
+    }
+    let items = value.as_array()?;
+    let mut ids = Vec::new();
+    for item in items {
+        if let Some(id) = json_i64(Some(item)) {
+            ids.push(id);
+        } else if let Some(text) = item.as_str() {
+            if let Ok(id) = text.parse::<i64>() {
+                ids.push(id);
+            }
+        }
+    }
+    Some(ids)
 }
 
 pub fn parse_chats(payload: &Value) -> Vec<Chat> {
@@ -700,6 +835,36 @@ pub fn parse_users(payload: &Value) -> Vec<User> {
         return Vec::new();
     };
     items.iter().filter_map(parse_user).collect()
+}
+
+pub fn parse_book(payload: &Value) -> Vec<User> {
+    let Some(contacts) = payload.get("contacts") else {
+        return Vec::new();
+    };
+    let items: Vec<&Value> = match contacts {
+        Value::Array(items) => items.iter().collect(),
+        Value::Object(map) => map.values().collect(),
+        _ => return Vec::new(),
+    };
+    items
+        .into_iter()
+        .filter(|item| !skipped_contact(item))
+        .filter_map(parse_user)
+        .collect()
+}
+
+fn skipped_contact(item: &Value) -> bool {
+    if matches!(
+        item.get("status").and_then(Value::as_str),
+        Some("BLOCKED" | "REMOVED")
+    ) {
+        return true;
+    }
+    // The address book is flag 512. Chat peers in the same array do not have it.
+    match json_i64(item.get("flags")) {
+        Some(flags) => flags & 512 == 0,
+        None => false,
+    }
 }
 
 pub fn parse_messages(payload: &Value) -> Vec<Message> {
@@ -727,6 +892,65 @@ pub fn me_id(payload: &Value) -> Option<i64> {
 
 pub fn sync_time(payload: &Value) -> Option<i64> {
     json_i64(payload.get("time"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContactErrorKind {
+    Missing,
+    Privacy,
+    Other,
+}
+
+pub fn split_contact_name(name: &str) -> (String, String) {
+    let name = name.trim();
+    match name.split_once(char::is_whitespace) {
+        Some((first, rest)) => (first.trim().to_owned(), rest.trim().to_owned()),
+        None => (name.to_owned(), String::new()),
+    }
+}
+
+pub fn add_contact_payload(phone: &str, first_name: &str, last_name: &str) -> Value {
+    let mut payload = json!({
+        "phone": phone,
+        "firstName": first_name,
+    });
+    if !last_name.is_empty() {
+        payload["lastName"] = json!(last_name);
+    }
+    payload
+}
+
+#[derive(Debug, Clone)]
+pub struct AddedContact {
+    pub id: i64,
+    pub fresh: bool,
+    pub user: Option<User>,
+}
+
+pub fn parse_added_contact(payload: &Value) -> Result<AddedContact> {
+    let user = payload.get("contact").and_then(parse_user);
+    let id = user
+        .as_ref()
+        .map(|user| user.id)
+        .or_else(|| json_i64(payload.get("id")))
+        .filter(|id| *id != 0)
+        .ok_or_else(|| Error::Protocol("MAX contact add did not return a contact".into()))?;
+    let fresh = payload.get("new").and_then(Value::as_bool).unwrap_or(false);
+    Ok(AddedContact { id, fresh, user })
+}
+
+pub fn contact_error_kind(err: &str) -> ContactErrorKind {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("not.found") || lower.contains("user.not.found") {
+        ContactErrorKind::Missing
+    } else if lower.contains("privacy")
+        || lower.contains("restricted")
+        || lower.contains("chat.denied")
+    {
+        ContactErrorKind::Privacy
+    } else {
+        ContactErrorKind::Other
+    }
 }
 
 #[cfg(test)]
@@ -814,6 +1038,28 @@ mod tests {
         assert_eq!(reply["message"]["attaches"][1]["audioId"], 7);
         assert_eq!(reply["message"]["attaches"][1]["duration"], 1500);
         assert!(reply["message"]["attaches"][1].get("wave").is_none());
+    }
+
+    #[test]
+    fn control_attach_marks_a_system_message() {
+        let message = parse_message(&json!({
+            "id": 1,
+            "chatId": 9,
+            "sender": 5,
+            "text": "",
+            "attaches": [{
+                "_type": "CONTROL",
+                "event": "new",
+                "chatType": "CHAT",
+                "title": "Систэрс"
+            }]
+        }))
+        .unwrap();
+        let control = message.control.unwrap();
+        assert_eq!(control.event.as_deref(), Some("new"));
+        assert_eq!(control.title.as_deref(), Some("Систэрс"));
+        assert!(message.media.is_empty());
+        assert!(message.text.is_empty());
     }
 
     #[test]
@@ -969,6 +1215,26 @@ mod tests {
     }
 
     #[test]
+    fn book_skips_blocked_and_removed() {
+        let users = parse_book(&json!({
+            "contacts": [
+                {"id": 1, "names": [{"name": "Ada"}], "flags": 512},
+                {"id": 2, "status": "BLOCKED", "names": [{"name": "Blocked"}], "flags": 512},
+                {"id": 3, "status": "REMOVED", "names": [{"name": "Removed"}]},
+                {"id": 4, "names": [{"name": "Peer"}], "flags": 0}
+            ]
+        }));
+        assert_eq!(users.iter().map(|user| user.id).collect::<Vec<_>>(), vec![1]);
+        let mapped = parse_book(&json!({
+            "contacts": {
+                "9": {"id": 9, "names": [{"name": "Ada"}], "flags": 512}
+            }
+        }));
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].id, 9);
+    }
+
+    #[test]
     fn display_name_prefers_custom_name() {
         let user = parse_user(&json!({
             "id": 1,
@@ -990,8 +1256,45 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(chat.peers, vec![5, 8]);
+        assert_eq!(chat.peer_marks.get(&5), Some(&1));
+        assert_eq!(chat.peer_marks.get(&8), Some(&2));
         assert!(chat.title.is_none());
         assert!(chat.photo.is_none());
+    }
+
+    #[test]
+    fn read_mark_parses_watermark_and_ids() {
+        let mark = parse_read_mark(&json!({
+            "chatId": 55,
+            "mark": 100,
+            "userId": 7,
+            "messageIds": ["11", 12]
+        }))
+        .unwrap();
+        assert_eq!(mark.chat_id, 55);
+        assert_eq!(mark.mark, 100);
+        assert_eq!(mark.user_id, Some(7));
+        assert_eq!(mark.message_ids, vec![11, 12]);
+    }
+
+    #[test]
+    fn delivery_mark_parses_message_ids() {
+        let mark = parse_delivery_mark(&json!({
+            "chatId": 55,
+            "messageId": "42"
+        }))
+        .unwrap();
+        assert_eq!(mark.chat_id, 55);
+        assert_eq!(mark.message_ids, vec![42]);
+    }
+
+    #[test]
+    fn mark_read_payload_uses_string_message_id() {
+        let payload = mark_read_payload(9, 42, 100);
+        assert_eq!(payload["type"], "READ_MESSAGE");
+        assert_eq!(payload["chatId"], 9);
+        assert_eq!(payload["messageId"], "42");
+        assert_eq!(payload["mark"], 100);
     }
 
     #[test]
@@ -1094,6 +1397,52 @@ mod tests {
         let payload = login_payload("token", -1, -1, -1, -1, false);
         assert_eq!(payload["userAgent"]["deviceType"], "ANDROID");
         assert_eq!(payload["userAgent"]["appVersion"], "26.25.0");
+        assert!(payload.get("configHash").is_some());
+        assert_eq!(payload["exp"]["chatsCountGroups"], "CjI=");
+        assert_eq!(payload["contactsSync"], -1);
+    }
+
+    #[test]
+    fn contact_add_splits_the_name_and_classifies_the_answer() {
+        assert_eq!(split_contact_name("  Иван Петров  "), ("Иван".into(), "Петров".into()));
+        assert_eq!(split_contact_name("Маня"), ("Маня".into(), String::new()));
+        let named = add_contact_payload("+79990001122", "Иван", "Петров");
+        assert_eq!(named["phone"], "+79990001122");
+        assert_eq!(named["firstName"], "Иван");
+        assert_eq!(named["lastName"], "Петров");
+        let single = add_contact_payload("79990001122", "Маня", "");
+        assert!(single.get("lastName").is_none());
+        let added = parse_added_contact(&json!({
+            "contact": {"id": 42, "names": [{"name": "Иван", "type": "ONEME"}]},
+            "new": true,
+        }))
+        .unwrap();
+        assert_eq!(added.id, 42);
+        assert!(added.fresh);
+        assert_eq!(added.user.unwrap().display_name(), "Иван");
+        let again = parse_added_contact(&json!({"contact": {"id": 42}, "new": false})).unwrap();
+        assert_eq!(again.id, 42);
+        assert!(!again.fresh);
+        let repeat = parse_added_contact(&json!({"contact": {"id": 42}})).unwrap();
+        assert!(!repeat.fresh);
+        assert!(parse_added_contact(&json!({})).is_err());
+        assert_eq!(
+            contact_error_kind("user.not.found: missing"),
+            ContactErrorKind::Missing
+        );
+        assert_eq!(
+            contact_error_kind("not.found"),
+            ContactErrorKind::Missing
+        );
+        assert_eq!(
+            contact_error_kind("privacy.restricted"),
+            ContactErrorKind::Privacy
+        );
+        assert_eq!(
+            contact_error_kind("chat.denied"),
+            ContactErrorKind::Privacy
+        );
+        assert_eq!(contact_error_kind("proto.payload"), ContactErrorKind::Other);
     }
 
     #[test]

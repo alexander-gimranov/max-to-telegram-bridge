@@ -1,12 +1,16 @@
-use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::fs;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{ConnectInfo, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use max_client::{new_device_id, write_session, CodeStatus, PendingAuth, Session};
+use max_client::{
+    contact_error_kind, new_device_id, AddedContact, CodeStatus, ContactErrorKind, PendingAuth,
+    Session, SessionLink, Store,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{watch, Mutex};
@@ -14,6 +18,7 @@ use tokio::sync::{watch, Mutex};
 use crate::text;
 
 pub const AUTH_URL: &str = "http://127.0.0.1:8787";
+pub const CONTACTS_URL: &str = "https://127.0.0.1:8788/contacts";
 const AUTH_HOLD: Duration = Duration::from_secs(180);
 
 async fn bind_auth() -> Result<tokio::net::TcpListener, String> {
@@ -49,6 +54,20 @@ fn page_html() -> &'static str {
     .as_str()
 }
 
+fn contacts_page_html() -> &'static str {
+    static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PAGE.get_or_init(|| {
+        include_str!("../webapp/contacts.html")
+            .replace("{{lang}}", text::HTML_LANG)
+            .replace("{{title}}", text::CONTACTS_TITLE)
+            .replace("{{name_label}}", text::NAME_LABEL)
+            .replace("{{phone_label}}", text::PHONE_LABEL)
+            .replace("{{add}}", text::ADD)
+            .replace("{{page_error}}", text::CONTACTS_PAGE_ERROR)
+    })
+    .as_str()
+}
+
 #[derive(Clone)]
 pub struct AuthHub {
     inner: Arc<Mutex<AuthInner>>,
@@ -56,7 +75,7 @@ pub struct AuthHub {
 }
 
 struct AuthInner {
-    session_path: PathBuf,
+    store: Arc<Store>,
     auth: Option<PendingAuth>,
     device_id: String,
     phase: Phase,
@@ -91,11 +110,11 @@ struct PasswordBody {
 }
 
 impl AuthHub {
-    pub fn new(session_path: PathBuf) -> Self {
+    pub fn new(store: Arc<Store>) -> Self {
         let (notify, _) = watch::channel(0u64);
         Self {
             inner: Arc::new(Mutex::new(AuthInner {
-                session_path,
+                store,
                 auth: None,
                 device_id: String::new(),
                 phase: Phase::Idle,
@@ -264,10 +283,10 @@ impl AuthHub {
             }
         };
         drop(auth);
-        if let Err(err) = write_session(
-            &inner.session_path,
-            &Session::signed_in(saved, device_id, instance_id),
-        ) {
+        if let Err(err) = inner
+            .store
+            .write_session(&Session::signed_in(saved, device_id, instance_id))
+        {
             inner.reset();
             return failure_step(&err.to_string());
         }
@@ -317,6 +336,114 @@ fn after_code(status: CodeStatus) -> AfterCode {
 
 pub fn from_loopback(addr: SocketAddr) -> bool {
     addr.ip().is_loopback()
+}
+
+#[derive(Clone)]
+struct ContactsHub {
+    link: watch::Receiver<Option<SessionLink>>,
+}
+
+#[derive(Deserialize)]
+struct ContactBody {
+    name: String,
+    phone: String,
+}
+
+pub fn reject_contact_form(name: &str, phone: &str) -> Option<&'static str> {
+    if name.trim().is_empty() {
+        Some(text::ENTER_NAME)
+    } else if phone.trim().is_empty() {
+        Some(text::ENTER_PHONE)
+    } else {
+        None
+    }
+}
+
+pub fn contact_failure_text(err: &str) -> String {
+    match contact_error_kind(err) {
+        ContactErrorKind::Missing => text::CONTACT_MISSING.to_owned(),
+        ContactErrorKind::Privacy => text::CONTACT_PRIVACY.to_owned(),
+        ContactErrorKind::Other => err.to_owned(),
+    }
+}
+
+fn contacts_message(added: &AddedContact) -> Value {
+    let message = if added.fresh {
+        text::CONTACT_ADDED
+    } else {
+        text::CONTACT_EXISTS
+    };
+    json!({ "message": message })
+}
+
+fn contacts_cert(dir: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let cert_path = dir.join("contacts-cert.pem");
+    let key_path = dir.join("contacts-key.pem");
+    if cert_path.is_file() && key_path.is_file() {
+        return Ok((cert_path, key_path));
+    }
+    fs::create_dir_all(dir).map_err(|err| err.to_string())?;
+    let mut params = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
+        .map_err(|err| err.to_string())?;
+    params
+        .subject_alt_names
+        .push(rcgen::SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+    let key_pair = rcgen::KeyPair::generate().map_err(|err| err.to_string())?;
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|err| err.to_string())?;
+    fs::write(&cert_path, cert.pem()).map_err(|err| err.to_string())?;
+    fs::write(&key_path, key_pair.serialize_pem()).map_err(|err| err.to_string())?;
+    Ok((cert_path, key_path))
+}
+
+pub async fn listen_contacts(
+    link: watch::Receiver<Option<SessionLink>>,
+    cert_dir: PathBuf,
+) -> Result<(), String> {
+    let (cert_path, key_path) = contacts_cert(&cert_dir)?;
+    max_client::install_tls_provider();
+    let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path)
+        .await
+        .map_err(|err| err.to_string())?;
+    let app = Router::new()
+        .route("/contacts", get(contacts_page).post(add_contact))
+        .with_state(ContactsHub { link });
+    eprintln!("bridge: contacts page at {CONTACTS_URL}");
+    axum_server::bind_rustls(SocketAddr::from(([127, 0, 0, 1], 8788)), config)
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+        .await
+        .map_err(|err| err.to_string())
+}
+
+async fn contacts_page(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<axum::response::Html<&'static str>, axum::http::StatusCode> {
+    if !from_loopback(addr) {
+        return Err(axum::http::StatusCode::FORBIDDEN);
+    }
+    Ok(axum::response::Html(contacts_page_html()))
+}
+
+async fn add_contact(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(hub): State<ContactsHub>,
+    Json(body): Json<ContactBody>,
+) -> Result<Json<Value>, axum::http::StatusCode> {
+    if !from_loopback(addr) {
+        return Err(axum::http::StatusCode::FORBIDDEN);
+    }
+    if let Some(message) = reject_contact_form(&body.name, &body.phone) {
+        return Ok(Json(json!({ "message": message })));
+    }
+    let link = hub.link.borrow().clone();
+    let Some(link) = link else {
+        return Ok(Json(json!({ "message": text::CONTACTS_NEED_SESSION })));
+    };
+    match link.add_contact(body.phone.trim(), body.name.trim()).await {
+        Ok(added) => Ok(Json(contacts_message(&added))),
+        Err(err) => Ok(Json(json!({ "message": contact_failure_text(&err.to_string()) }))),
+    }
 }
 
 pub fn code_step(digits: i64, wait_secs: i64) -> Value {
@@ -443,6 +570,28 @@ mod tests {
         assert!(page.contains(text::AUTH_TITLE));
         assert!(page.contains(text::PHONE_LABEL));
         assert!(page.contains(text::PAGE_ERROR));
+        assert!(!page.contains("{{"));
+    }
+
+    #[test]
+    fn contact_form_rejects_empty_fields_and_names_the_page() {
+        assert_eq!(reject_contact_form(" ", "+7999"), Some(text::ENTER_NAME));
+        assert_eq!(reject_contact_form("Анна", " "), Some(text::ENTER_PHONE));
+        assert!(reject_contact_form("Анна", "+7999").is_none());
+        assert_eq!(
+            contact_failure_text("user.not.found"),
+            text::CONTACT_MISSING
+        );
+        assert_eq!(
+            contact_failure_text("privacy.restricted"),
+            text::CONTACT_PRIVACY
+        );
+        let page = contacts_page_html();
+        assert!(page.contains("id=\"name-input\""));
+        assert!(page.contains("id=\"phone-input\""));
+        assert!(page.contains(text::ADD));
+        assert!(page.contains(text::CONTACTS_TITLE));
+        assert!(page.contains(text::PHONE_LABEL));
         assert!(!page.contains("{{"));
     }
 }

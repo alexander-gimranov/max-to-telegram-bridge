@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="{{lang}}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{title}}</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: sans-serif;
+      background: #10141c;
+      color: #f4f7fb;
+    }
+    main {
+      max-width: 24rem;
+      margin: 3rem auto;
+      padding: 0 1rem;
+    }
+    h1 {
+      font-size: 1.4rem;
+      font-weight: 600;
+    }
+    form {
+      display: grid;
+      gap: 0.75rem;
+    }
+    label {
+      font-size: 0.9rem;
+    }
+    input {
+      font: inherit;
+      padding: 0.6rem 0.7rem;
+      border: 1px solid #3d4b63;
+      border-radius: 0.4rem;
+      background: #1b2330;
+      color: inherit;
+    }
+    button {
+      font: inherit;
+      padding: 0.65rem 0.8rem;
+      border: 0;
+      border-radius: 0.4rem;
+      background: #3d7eff;
+      color: white;
+    }
+    button:disabled {
+      opacity: 0.6;
+    }
+    #status {
+      min-height: 1.4rem;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{{title}}</h1>
+    <p id="status" role="status"></p>
+    <form id="contact-form">
+      <label for="name-input">{{name_label}}</label>
+      <input id="name-input" name="name" autocomplete="name" required>
+      <label for="phone-input">{{phone_label}}</label>
+      <input id="phone-input" name="phone" autocomplete="tel" required>
+      <button type="submit">{{add}}</button>
+    </form>
+  </main>
+  <script>
+    const status = document.getElementById("status");
+
+    document.getElementById("contact-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const form = event.target;
+      const button = form.querySelector("button");
+      button.disabled = true;
+      status.textContent = "";
+      const name = document.getElementById("name-input").value;
+      const phone = document.getElementById("phone-input").value;
+      try {
+        const response = await fetch("/contacts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name, phone }),
+        });
+        const payload = await response.json();
+        status.textContent = payload.message || "";
+      } catch (err) {
+        status.textContent = "{{page_error}}";
+      } finally {
+        button.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

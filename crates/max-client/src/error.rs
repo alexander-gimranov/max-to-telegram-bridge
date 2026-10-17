@@ -10,6 +10,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("{0}")]
     Json(#[from] serde_json::Error),
+    #[error("{0}")]
+    Db(#[from] rusqlite::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
