@@ -9,7 +9,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::conn::{lookup_v4, tls_config};
 use crate::error::{Error, Result};
-use crate::models::{handshake_payload, Attach, VideoTicket, VoiceTicket};
+use crate::models::{mobile_handshake_payload, Attach, VideoTicket, VoiceTicket};
 use crate::profile::Session;
 
 const HOST: &str = "api.oneme.ru";
@@ -55,9 +55,35 @@ impl VoiceLink {
         voice_ticket(&payload)
     }
 
-    pub async fn ticket_video(&mut self) -> Result<VideoTicket> {
-        let payload = roundtrip(self, 82, video_upload_request()).await?;
+    pub async fn ticket_video(&mut self, note: bool) -> Result<VideoTicket> {
+        let payload = roundtrip(self, 82, video_upload_request(note)).await?;
         video_ticket(&payload)
+    }
+
+    /// Wait for NOTIF_ATTACH (136) with matching videoId.
+    /// Returns `true` if ready arrived, `false` if `timeout` elapsed.
+    pub async fn wait_video_ready(
+        &mut self,
+        video_id: i64,
+        timeout: Duration,
+    ) -> Result<bool> {
+        match tokio::time::timeout(timeout, async {
+            loop {
+                let (_cmd, _seq, opcode, body) = read_frame(&mut self.stream).await?;
+                if opcode != 136 {
+                    continue;
+                }
+                if attach_ready_id(&body) == Some(video_id) {
+                    return Ok(());
+                }
+            }
+        })
+        .await
+        {
+            Ok(Ok(())) => Ok(true),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Ok(false),
+        }
     }
 
     pub async fn finish(
@@ -94,6 +120,7 @@ impl VoiceLink {
         video_id: i64,
         token: &str,
         video_type: Option<i64>,
+        thumbhash: Option<&[u8]>,
         photos: &[Attach],
     ) -> Result<Option<(i64, i64)>> {
         let cid = now_ms();
@@ -103,7 +130,17 @@ impl VoiceLink {
         let payload = roundtrip(
             self,
             64,
-            send_video_request(chat_id, text, cid, reply_to, video_id, token, video_type, photos),
+            send_video_request(
+                chat_id,
+                text,
+                cid,
+                reply_to,
+                video_id,
+                token,
+                video_type,
+                thumbhash,
+                photos,
+            ),
         )
         .await?;
         Ok(sent_stamp(&payload))
@@ -129,10 +166,29 @@ async fn connect_voice(
             stream: &mut stream,
             seq: 0,
         };
+        let instance_id = if session.instance_id.is_empty() {
+            // Match conn.rs: stable-ish id for this process when session has none.
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos() as u64)
+                .unwrap_or(0);
+            format!("{:016x}", nanos ^ 0xA5A5_A5A5_A5A5_A5A5)
+        } else {
+            session.instance_id.clone()
+        };
+        let mut mixed = 0i64;
+        for byte in session.device_id.bytes() {
+            mixed = mixed.wrapping_mul(31).wrapping_add(i64::from(byte));
+        }
+        let client_session_id = (mixed.unsigned_abs() % 70) as i64 + 1;
         let hello = roundtrip_on(
             &mut link,
             6,
-            json_as_msgpack(&handshake_payload(&session.device_id, false)),
+            json_as_msgpack(&mobile_handshake_payload(
+                &session.device_id,
+                &instance_id,
+                client_session_id,
+            )),
         )
         .await?;
         if let Some(err) = error_text(&hello) {
@@ -177,7 +233,11 @@ async fn roundtrip_on(
         link.stream.write_all(&frame).await?;
         link.stream.flush().await?;
         loop {
-            let (cmd, got, body) = read_frame(link.stream).await?;
+            let (cmd, got, opcode, body) = read_frame(link.stream).await?;
+            // Keep scanning: NOTIF_ATTACH (136) can arrive before the reply.
+            if opcode == 136 {
+                continue;
+            }
             if got != seq && got != (seq & 0xff) {
                 continue;
             }
@@ -198,11 +258,12 @@ async fn roundtrip_on(
 
 async fn read_frame(
     stream: &mut tokio_rustls::client::TlsStream<TcpStream>,
-) -> Result<(u8, u16, rmpv::Value)> {
+) -> Result<(u8, u16, u16, rmpv::Value)> {
     let mut header = [0u8; 10];
     stream.read_exact(&mut header).await?;
     let cmd = header[1];
     let seq = u16::from_be_bytes([header[2], header[3]]);
+    let opcode = u16::from_be_bytes([header[4], header[5]]);
     let packed = u32::from_be_bytes([header[6], header[7], header[8], header[9]]);
     let compressed = packed & 0x0100_0000 != 0;
     let len = (packed & 0x00ff_ffff) as usize;
@@ -213,7 +274,7 @@ async fn read_frame(
     if compressed {
         body = inflate(&body)?;
     }
-    Ok((cmd, seq, decode_payload(&body)?))
+    Ok((cmd, seq, opcode, decode_payload(&body)?))
 }
 
 fn pack_frame(cmd: u8, seq: u16, opcode: u16, payload: &rmpv::Value) -> Result<Vec<u8>> {
@@ -293,10 +354,14 @@ fn upload_request() -> rmpv::Value {
     ])
 }
 
-fn video_upload_request() -> rmpv::Value {
+/// Regular video: type=0/uploaderType=0 (CDN).
+/// Video note: type=1/uploaderType=0 (CDN) — same as mobile / max-account-api.
+/// Never use uploaderType=1 for video: that yields /uploadVideo and rejects the body.
+fn video_upload_request(note: bool) -> rmpv::Value {
+    let kind = if note { 1 } else { 0 };
     rmpv::Value::Map(vec![
         pair("count", int(1)),
-        pair("type", int(1)),
+        pair("type", int(kind)),
         pair("uploaderType", int(0)),
     ])
 }
@@ -420,6 +485,7 @@ fn send_video_request(
     video_id: i64,
     token: &str,
     video_type: Option<i64>,
+    thumbhash: Option<&[u8]>,
     photos: &[Attach],
 ) -> rmpv::Value {
     let mut attaches = Vec::new();
@@ -431,14 +497,26 @@ fn send_video_request(
             ]));
         }
     }
-    let mut video = vec![
-        pair("_type", text("VIDEO")),
-        pair("videoId", int(video_id)),
-        pair("token", text(token)),
-    ];
-    if video_type == Some(1) {
-        video.push(pair("videoType", int(1)));
-    }
+    // Regular: videoId + token + videoType:0 (after VIDEO_READY).
+    // Note (mobile): token + videoType:1 + thumbhash (empty ok; server fills).
+    let video = if video_type == Some(1) {
+        vec![
+            pair("_type", text("VIDEO")),
+            pair("token", text(token)),
+            pair("videoType", int(1)),
+            pair(
+                "thumbhash",
+                rmpv::Value::Binary(thumbhash.unwrap_or(&[]).to_vec()),
+            ),
+        ]
+    } else {
+        vec![
+            pair("_type", text("VIDEO")),
+            pair("videoId", int(video_id)),
+            pair("token", text(token)),
+            pair("videoType", int(0)),
+        ]
+    };
     attaches.push(rmpv::Value::Map(video));
     let mut message = vec![
         pair("text", text(text_body)),
@@ -474,6 +552,15 @@ fn wave_bin(wave: &[u8]) -> rmpv::Value {
     let count = wave.len().min(80);
     bytes[..count].copy_from_slice(&wave[..count]);
     rmpv::Value::Binary(bytes)
+}
+
+fn attach_ready_id(value: &rmpv::Value) -> Option<i64> {
+    for key in ["videoId", "audioId", "fileId"] {
+        if let Some(id) = map_get(value, key).and_then(as_i64) {
+            return Some(id);
+        }
+    }
+    None
 }
 
 fn error_text(value: &rmpv::Value) -> Option<String> {

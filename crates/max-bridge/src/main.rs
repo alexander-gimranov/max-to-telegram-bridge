@@ -26,8 +26,9 @@ use tokio::sync::watch;
 const TELEGRAM_HOST: &str = "api.telegram.org";
 const MAX_MEDIA_BYTES: usize = 20 * 1024 * 1024;
 const STALL_AFTER_SECS: u64 = 180;
-const REACT_SENT: &str = "⏳";
-const REACT_ARRIVED: &str = "✅";
+// Telegram bots may only set reactions from the Bot API allowlist.
+const REACT_SENT: &str = "⚡";
+const REACT_ARRIVED: &str = "👍";
 const REACT_READ: &str = "👀";
 
 fn main() {
@@ -271,20 +272,25 @@ fn panel_text(link: LinkState) -> &'static str {
     }
 }
 
+fn mini_app_button(link: LinkState) -> Value {
+    let label = match link {
+        LinkState::Ready => text::ADD_CONTACT,
+        LinkState::Off | LinkState::Connecting => text::SETUP,
+    };
+    json!({
+        "text": label,
+        "web_app": {"url": auth_http::MINI_APP_URL}
+    })
+}
+
 fn panel_markup(link: LinkState) -> Value {
     match link {
-        LinkState::Off => json!({
-            "inline_keyboard": [[{
-                "text": text::SETUP,
-                "url": auth_http::AUTH_URL
-            }]]
-        }),
-        LinkState::Connecting => json!({
-            "inline_keyboard": []
+        LinkState::Off | LinkState::Connecting => json!({
+            "inline_keyboard": [[mini_app_button(link)]]
         }),
         LinkState::Ready => json!({
             "inline_keyboard": [
-                [{"text": text::ADD_CONTACT, "web_app": {"url": auth_http::CONTACTS_URL}}],
+                [mini_app_button(link)],
                 [{"text": text::LOAD_HISTORY, "callback_data": "history"}],
                 [{"text": text::RELOAD_HISTORY, "callback_data": "reread"}],
                 [{"text": text::SIGN_OUT, "callback_data": "logout"}]
@@ -528,9 +534,10 @@ async fn run(config: Config) -> Result<(), String> {
     });
     let (session_link, contacts_link) = watch::channel(None::<SessionLink>);
     let contacts_dir = var_dir();
+    let mini_auth = auth.clone();
     tokio::spawn(async move {
-        if let Err(err) = auth_http::listen_contacts(contacts_link, contacts_dir).await {
-            eprintln!("bridge: contacts page failed: {err}");
+        if let Err(err) = auth_http::listen_mini(mini_auth, contacts_link, contacts_dir).await {
+            eprintln!("bridge: mini app failed: {err}");
         }
     });
     let mut http = telegram_http().await?;
@@ -729,6 +736,14 @@ async fn run(config: Config) -> Result<(), String> {
                         continue;
                     };
                     if echoes.remove(&message.id) {
+                        for item in &message.media {
+                            if let Media::Video { video_type, .. } = item {
+                                eprintln!(
+                                    "bridge: max echo video id={} video_type={video_type:?}",
+                                    message.id
+                                );
+                            }
+                        }
                         mark_seen(&mut seen, &config.store, &message);
                         continue;
                     }
@@ -1898,17 +1913,31 @@ async fn send_telegram_media(
     let sent = match item {
         Media::Photo { .. } => {
             let mime = image_mime(bytes);
-            telegram_file(
-                http,
-                &config.token,
-                "sendPhoto",
-                fields,
-                "photo",
-                image_name(mime),
-                mime,
-                bytes,
-            )
-            .await?
+            if mime == "image/gif" {
+                telegram_file(
+                    http,
+                    &config.token,
+                    "sendAnimation",
+                    fields,
+                    "animation",
+                    "animation.gif",
+                    mime,
+                    bytes,
+                )
+                .await?
+            } else {
+                telegram_file(
+                    http,
+                    &config.token,
+                    "sendPhoto",
+                    fields,
+                    "photo",
+                    image_name(mime),
+                    mime,
+                    bytes,
+                )
+                .await?
+            }
         }
         Media::Voice { .. } => {
             match telegram_file(
@@ -1930,45 +1959,37 @@ async fn send_telegram_media(
                 }
             }
         }
-        Media::Video { video_type, .. } if video_type == &Some(1) => {
-            let note_fields: Vec<(String, String)> = fields
-                .into_iter()
-                .filter(|(key, _)| key != "caption" && key != "caption_entities")
-                .collect();
-            if !caption.is_empty() {
-                let mut body = json!({"chat_id": tg_user, "text": caption});
-                if let Some(thread_id) = thread_id {
-                    body["message_thread_id"] = json!(thread_id);
-                }
-                if let Some(entities) = bold_prefix_entities(bold_prefix, caption) {
-                    body["entities"] = entities;
-                }
-                let _ = telegram(http, &config.token, "sendMessage", body).await;
-            }
-            telegram_file(
-                http,
-                &config.token,
-                "sendVideoNote",
-                note_fields,
-                "video_note",
-                "note.mp4",
-                "video/mp4",
-                bytes,
-            )
-            .await?
-        }
         Media::Video { .. } => {
-            telegram_file(
+            // MAX marks many short square clips (including Telegram GIFs) as
+            // videoType=1. Prefer animation so they stay rectangular in TG.
+            match telegram_file(
                 http,
                 &config.token,
-                "sendVideo",
-                fields,
-                "video",
-                "video.mp4",
+                "sendAnimation",
+                fields.clone(),
+                "animation",
+                "animation.mp4",
                 "video/mp4",
                 bytes,
             )
-            .await?
+            .await
+            {
+                Ok(sent) => sent,
+                Err(err) => {
+                    eprintln!("bridge: animation send failed: {err}");
+                    telegram_file(
+                        http,
+                        &config.token,
+                        "sendVideo",
+                        fields,
+                        "video",
+                        "video.mp4",
+                        "video/mp4",
+                        bytes,
+                    )
+                    .await?
+                }
+            }
         }
     };
     sent.get("result")
@@ -3177,6 +3198,18 @@ async fn handle_update(
         .as_ref()
         .filter(|voice| !voice.file_id.is_empty());
     let video_clip = inbound_video(message);
+    if let Some((file_id, video_type)) = video_clip {
+        let kind = if message.video_note.is_some() {
+            "video_note"
+        } else if message.animation.is_some() {
+            "animation"
+        } else {
+            "video"
+        };
+        eprintln!(
+            "bridge: tg media {kind} file={file_id} video_type={video_type:?}"
+        );
+    }
     if text.is_empty() && photo_id.is_none() && voice.is_none() && video_clip.is_none() {
         return Ok(());
     }
@@ -3258,18 +3291,42 @@ async fn handle_update(
             true,
         )
     } else if let Some((bytes, video_type)) = video_file {
-        let body = if video_type == Some(1) {
-            ""
+        if video_type != Some(1) && bytes.starts_with(b"GIF8") {
+            match upload_photo(client, &bytes).await {
+                Ok(token) => {
+                    let mut photos = attaches;
+                    photos.push(Attach::Photo { token });
+                    (
+                        send_with_voice_retry(client, chat_id, &text, reply_to, photos).await,
+                        true,
+                    )
+                }
+                Err(err) => {
+                    eprintln!("bridge: gif photo upload failed: {err}");
+                    let body = text.as_str();
+                    (
+                        send_video_on_tcp(
+                            client, chat_id, body, reply_to, &bytes, Some(0), attaches,
+                        )
+                        .await,
+                        true,
+                    )
+                }
+            }
         } else {
-            text.as_str()
-        };
-        (
-            send_video_on_tcp(
-                client, chat_id, body, reply_to, &bytes, video_type, attaches,
+            let body = if video_type == Some(1) {
+                ""
+            } else {
+                text.as_str()
+            };
+            (
+                send_video_on_tcp(
+                    client, chat_id, body, reply_to, &bytes, video_type, attaches,
+                )
+                .await,
+                true,
             )
-            .await,
-            true,
-        )
+        }
     } else {
         (
             send_with_voice_retry(client, chat_id, &text, reply_to, attaches).await,
@@ -3343,13 +3400,14 @@ fn inbound_video(message: &TgMessage) -> Option<(&str, Option<i64>)> {
         .as_ref()
         .filter(|animation| !animation.file_id.is_empty())
     {
-        return Some((animation.file_id.as_str(), None));
+        // Explicit 0: short square MP4 GIFs become circular notes without it.
+        return Some((animation.file_id.as_str(), Some(0)));
     }
     message
         .video
         .as_ref()
         .filter(|video| !video.file_id.is_empty())
-        .map(|video| (video.file_id.as_str(), None))
+        .map(|video| (video.file_id.as_str(), Some(0)))
 }
 
 fn largest_file_id(photos: &[PhotoSize]) -> Option<String> {
@@ -3580,15 +3638,108 @@ async fn send_video_on_tcp(
     video_type: Option<i64>,
     photos: Vec<Attach>,
 ) -> Result<Option<i64>, String> {
+    if video_type == Some(1) {
+        return send_video_note_on_tcp(client, chat_id, reply_to, bytes, photos).await;
+    }
+    let started = std::time::Instant::now();
+    eprintln!("bridge: max video send note=false bytes={}", bytes.len());
     let mut link = client.open_voice().await.map_err(|err| err.to_string())?;
-    let ticket = link.ticket_video().await.map_err(|err| err.to_string())?;
+    eprintln!("bridge: video session open ms={}", started.elapsed().as_millis());
+    let ticket = link
+        .ticket_video(false)
+        .await
+        .map_err(|err| err.to_string())?;
     let (video_id, token) = upload_video(&ticket.url, ticket.video_id, ticket.token, bytes).await?;
-    link.finish_video(
-        chat_id, text, reply_to, video_id, &token, video_type, &photos,
-    )
-    .await
-    .map(|stamp| stamp.map(|(id, _)| id))
-    .map_err(|err| err.to_string())
+    eprintln!(
+        "bridge: video uploaded video_id={video_id} ms={}",
+        started.elapsed().as_millis()
+    );
+    let ready = link
+        .wait_video_ready(video_id, Duration::from_secs(8))
+        .await
+        .map_err(|err| err.to_string())?;
+    eprintln!(
+        "bridge: video ready={} video_id={video_id} ms={}",
+        ready,
+        started.elapsed().as_millis()
+    );
+    let sent = link
+        .finish_video(
+            chat_id,
+            text,
+            reply_to,
+            video_id,
+            &token,
+            Some(0),
+            None,
+            &photos,
+        )
+        .await
+        .map(|stamp| stamp.map(|(id, _)| id))
+        .map_err(|err| err.to_string())?;
+    eprintln!(
+        "bridge: max video sent id={sent:?} note=false ms={}",
+        started.elapsed().as_millis()
+    );
+    Ok(sent)
+}
+
+/// Video note path (mobile / max-account-api):
+/// op 82 type=1/uploaderType=0 → OK-CDN POST → optional VIDEO_READY →
+/// attach token + videoType:1 + thumbhash.
+async fn send_video_note_on_tcp(
+    client: &Client,
+    chat_id: i64,
+    reply_to: Option<i64>,
+    bytes: &[u8],
+    photos: Vec<Attach>,
+) -> Result<Option<i64>, String> {
+    let started = std::time::Instant::now();
+    eprintln!("bridge: max video_note send bytes={}", bytes.len());
+    let mut link = client.open_voice().await.map_err(|err| err.to_string())?;
+    eprintln!(
+        "bridge: video_note session open ms={}",
+        started.elapsed().as_millis()
+    );
+    let ticket = link
+        .ticket_video(true)
+        .await
+        .map_err(|err| err.to_string())?;
+    let (video_id, token, thumbhash) =
+        upload_video_note(&ticket.url, ticket.video_id, ticket.token, bytes).await?;
+    eprintln!(
+        "bridge: video_note uploaded video_id={video_id} thumb={} ms={}",
+        thumbhash.is_some(),
+        started.elapsed().as_millis()
+    );
+    let ready = link
+        .wait_video_ready(video_id, Duration::from_secs(8))
+        .await
+        .map_err(|err| err.to_string())?;
+    eprintln!(
+        "bridge: video_note ready={} video_id={video_id} ms={}",
+        ready,
+        started.elapsed().as_millis()
+    );
+    let sent = link
+        .finish_video(
+            chat_id,
+            "",
+            reply_to,
+            video_id,
+            &token,
+            Some(1),
+            thumbhash.as_deref(),
+            &photos,
+        )
+        .await
+        .map(|stamp| stamp.map(|(id, _)| id))
+        .map_err(|err| err.to_string())?;
+    eprintln!(
+        "bridge: max video_note sent id={sent:?} ms={}",
+        started.elapsed().as_millis()
+    );
+    Ok(sent)
 }
 
 async fn upload_video(
@@ -3607,17 +3758,16 @@ async fn upload_video(
     );
     let body = bytes.to_vec();
     let range = content_range_header(len);
+    // PyMax regular video: filename= + Content-Range + Content-Length.
+    let file_name = format!("video-{len}.mp4");
     let response = post_https(url, "video upload failed", |builder| {
         builder
             .header(
-                "User-Agent",
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+                "Content-Disposition",
+                format!("attachment; filename={file_name}"),
             )
-            .header("Content-Disposition", "attachment; filename=video.mp4")
-            .header("Content-Type", "application/x-binary")
-            .header("Content-Length", len.to_string())
             .header("Content-Range", range)
-            .header("X-Uploading-Mode", "parallel")
+            .header("Content-Length", len.to_string())
             .header("Connection", "keep-alive")
             .body(body)
     })
@@ -3626,12 +3776,87 @@ async fn upload_video(
         .text()
         .await
         .map_err(|_| "video upload failed".to_owned())?;
-    eprintln!("bridge: video upload body {}", upload_body_note(&body));
+    let note = upload_body_note(&body);
+    eprintln!("bridge: video upload body {note}");
+    if note.starts_with("len=") {
+        let preview: String = body.chars().take(80).collect();
+        eprintln!("bridge: video upload raw {preview:?}");
+    }
     if let Some(err) = upload_error(&body) {
         return Err(err);
     }
     let token = uploaded_token(&body).unwrap_or(fallback_token);
     Ok((video_id, token))
+}
+
+async fn upload_video_note(
+    url: &str,
+    video_id: i64,
+    fallback_token: String,
+    bytes: &[u8],
+) -> Result<(i64, String, Option<Vec<u8>>), String> {
+    if bytes.is_empty() || bytes.len() > MAX_MEDIA_BYTES {
+        return Err(media_size_error(bytes.len()));
+    }
+    let len = bytes.len();
+    eprintln!(
+        "bridge: video_note upload bytes={len} place={}",
+        upload_place(url)
+    );
+    let body = bytes.to_vec();
+    let range = content_range_header(len);
+    // Mobile OK-CDN shape (ru.oneme.app): x-binary + fileName= + X-Uploading-Mode.
+    // Filename is an opaque negative digit string, not a real .mp4 name.
+    let sniff_name = format!("-{}", video_id.unsigned_abs() % 2_147_483_647);
+    let response = post_https(url, "video_note upload failed", |builder| {
+        builder
+            .header(
+                "Content-Type",
+                "application/x-binary; charset=x-user-defined",
+            )
+            .header(
+                "Content-Disposition",
+                format!("attachment; fileName=\"{sniff_name}\""),
+            )
+            .header("Content-Range", range)
+            .header("Content-Length", len.to_string())
+            .header("X-Uploading-Mode", "parallel")
+            .header("Connection", "keep-alive")
+            .body(body)
+    })
+    .await?;
+    let body = response
+        .text()
+        .await
+        .map_err(|_| "video_note upload failed".to_owned())?;
+    let note = upload_body_note(&body);
+    eprintln!("bridge: video_note upload body {note}");
+    if note.starts_with("len=") {
+        let preview: String = body.chars().take(80).collect();
+        eprintln!("bridge: video_note upload raw {preview:?}");
+    }
+    if let Some(err) = upload_error(&body) {
+        let preview: String = body.chars().take(200).collect();
+        eprintln!("bridge: video_note upload error raw {preview}");
+        return Err(err);
+    }
+    let token = uploaded_token(&body).unwrap_or(fallback_token);
+    let thumbhash = upload_thumbhash(&body);
+    Ok((video_id, token, thumbhash))
+}
+
+fn upload_thumbhash(body: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let value: Value = serde_json::from_str(body.trim()).ok()?;
+    let raw = value.get("thumbhash").and_then(Value::as_str)?;
+    if raw.is_empty() {
+        return None;
+    }
+    let mut padded = raw.to_owned();
+    while padded.len() % 4 != 0 {
+        padded.push('=');
+    }
+    base64::engine::general_purpose::STANDARD.decode(padded).ok()
 }
 
 async fn upload_voice(
@@ -3727,9 +3952,13 @@ fn upload_error(body: &str) -> Option<String> {
         return None;
     }
     if trimmed.starts_with('<') {
-        return Some("voice upload rejected".into());
+        return Some("upload rejected".into());
     }
     let value: Value = serde_json::from_str(trimmed).ok()?;
+    let code = value
+        .get("error_code")
+        .or_else(|| value.get("errorCode"))
+        .and_then(|item| item.as_str().map(str::to_owned).or_else(|| item.as_i64().map(|n| n.to_string())));
     let failed = value.get("error").is_some()
         || value.get("errorCode").is_some()
         || value.get("error_code").is_some();
@@ -3747,9 +3976,11 @@ fn upload_error(body: &str) -> Option<String> {
                 && !text.contains('?')
                 && !text.contains('&')
         });
-    Some(match message {
-        Some(text) => format!("voice upload rejected: {text}"),
-        None => "voice upload rejected".into(),
+    Some(match (code.as_deref(), message) {
+        (Some(code), Some(text)) => format!("upload rejected: {code}: {text}"),
+        (Some(code), None) => format!("upload rejected: {code}"),
+        (None, Some(text)) => format!("upload rejected: {text}"),
+        (None, None) => "upload rejected".into(),
     })
 }
 
@@ -4198,6 +4429,42 @@ mod tests {
         };
         assert_eq!(topic_label(4, &dialog, "Маня Н"), "Маня Н");
         assert_eq!(topic_label(0, &dialog, "я"), text::FAVORITES);
+    }
+
+    #[test]
+    fn inbound_video_marks_gif_as_regular_not_note() {
+        let gif = TgMessage {
+            message_id: 1,
+            from: None,
+            text: None,
+            caption: None,
+            photo: Vec::new(),
+            voice: None,
+            video: None,
+            video_note: None,
+            animation: Some(TgFile {
+                file_id: "gif1".into(),
+            }),
+            thread_id: None,
+            reply_to: None,
+        };
+        assert_eq!(inbound_video(&gif), Some(("gif1", Some(0))));
+        let note = TgMessage {
+            message_id: 2,
+            from: None,
+            text: None,
+            caption: None,
+            photo: Vec::new(),
+            voice: None,
+            video: None,
+            video_note: Some(TgFile {
+                file_id: "note1".into(),
+            }),
+            animation: None,
+            thread_id: None,
+            reply_to: None,
+        };
+        assert_eq!(inbound_video(&note), Some(("note1", Some(1))));
     }
 
     #[test]
@@ -4693,28 +4960,33 @@ mod tests {
     }
 
     #[test]
-    fn setup_stays_hidden_until_the_session_is_ready() {
+    fn panel_keeps_the_mini_app_button() {
         assert!(!history_allowed(LinkState::Off));
         assert!(!history_allowed(LinkState::Connecting));
         assert!(history_allowed(LinkState::Ready));
         let off = panel_markup(LinkState::Off);
         assert_eq!(off["inline_keyboard"][0][0]["text"], text::SETUP);
-        assert_eq!(off["inline_keyboard"][0][0]["url"], auth_http::AUTH_URL);
-        assert!(off["inline_keyboard"][0][0].get("callback_data").is_none());
+        assert_eq!(
+            off["inline_keyboard"][0][0]["web_app"]["url"],
+            auth_http::MINI_APP_URL
+        );
+        assert!(off["inline_keyboard"][0][0].get("url").is_none());
         let connecting = panel_markup(LinkState::Connecting);
-        assert!(connecting["inline_keyboard"].as_array().unwrap().is_empty());
+        assert_eq!(connecting["inline_keyboard"][0][0]["text"], text::SETUP);
+        assert_eq!(
+            connecting["inline_keyboard"][0][0]["web_app"]["url"],
+            auth_http::MINI_APP_URL
+        );
         let ready = panel_markup(LinkState::Ready);
         assert_eq!(ready["inline_keyboard"][0][0]["text"], text::ADD_CONTACT);
         assert_eq!(
             ready["inline_keyboard"][0][0]["web_app"]["url"],
-            auth_http::CONTACTS_URL
+            auth_http::MINI_APP_URL
         );
         assert!(ready["inline_keyboard"][0][0].get("callback_data").is_none());
         assert_eq!(ready["inline_keyboard"][1][0]["callback_data"], "history");
         assert_eq!(ready["inline_keyboard"][2][0]["callback_data"], "reread");
         assert_eq!(ready["inline_keyboard"][3][0]["callback_data"], "logout");
-        assert!(!off.to_string().contains("web_app"));
-        assert!(!connecting.to_string().contains("web_app"));
         assert_eq!(command_list(LinkState::Off)[0]["command"], "setup");
         assert_eq!(command_list(LinkState::Ready)[2]["command"], "logout");
         assert!(command_list(LinkState::Connecting)

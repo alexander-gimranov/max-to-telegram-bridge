@@ -424,15 +424,20 @@ fn attach_json(attach: &Attach) -> Value {
             token,
             video_type,
         } => {
-            let mut attach = json!({
-                "_type": "VIDEO",
-                "videoId": video_id,
-                "token": token,
-            });
             if video_type == &Some(1) {
-                attach["videoType"] = json!(1);
+                json!({
+                    "_type": "VIDEO",
+                    "token": token,
+                    "videoType": 1,
+                })
+            } else {
+                json!({
+                    "_type": "VIDEO",
+                    "videoId": video_id,
+                    "token": token,
+                    "videoType": 0,
+                })
             }
-            attach
         }
     }
 }
@@ -1187,9 +1192,9 @@ mod tests {
             }],
         );
         assert_eq!(note["message"]["attaches"][0]["_type"], "VIDEO");
-        assert_eq!(note["message"]["attaches"][0]["videoId"], 7);
         assert_eq!(note["message"]["attaches"][0]["token"], "tok");
         assert_eq!(note["message"]["attaches"][0]["videoType"], 1);
+        assert!(note["message"]["attaches"][0].get("videoId").is_none());
         let plain = send_payload(
             9,
             "",
@@ -1201,7 +1206,9 @@ mod tests {
                 video_type: None,
             }],
         );
-        assert!(plain["message"]["attaches"][0].get("videoType").is_none());
+        assert_eq!(plain["message"]["attaches"][0]["videoType"], 0);
+        assert_eq!(plain["message"]["attaches"][0]["videoId"], 8);
+        assert_eq!(plain["message"]["attaches"][0]["token"], "tok2");
     }
 
     #[test]

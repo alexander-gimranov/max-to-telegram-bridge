@@ -18,7 +18,7 @@ use tokio::sync::{watch, Mutex};
 use crate::text;
 
 pub const AUTH_URL: &str = "http://127.0.0.1:8787";
-pub const CONTACTS_URL: &str = "https://127.0.0.1:8788/contacts";
+pub const MINI_APP_URL: &str = "https://127.0.0.1:8788/app";
 const AUTH_HOLD: Duration = Duration::from_secs(180);
 
 async fn bind_auth() -> Result<tokio::net::TcpListener, String> {
@@ -339,7 +339,7 @@ pub fn from_loopback(addr: SocketAddr) -> bool {
 }
 
 #[derive(Clone)]
-struct ContactsHub {
+struct MiniHub {
     link: watch::Receiver<Option<SessionLink>>,
 }
 
@@ -397,7 +397,8 @@ fn contacts_cert(dir: &Path) -> Result<(PathBuf, PathBuf), String> {
     Ok((cert_path, key_path))
 }
 
-pub async fn listen_contacts(
+pub async fn listen_mini(
+    auth: AuthHub,
     link: watch::Receiver<Option<SessionLink>>,
     cert_dir: PathBuf,
 ) -> Result<(), String> {
@@ -406,32 +407,47 @@ pub async fn listen_contacts(
     let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path)
         .await
         .map_err(|err| err.to_string())?;
-    let app = Router::new()
-        .route("/contacts", get(contacts_page).post(add_contact))
-        .with_state(ContactsHub { link });
-    eprintln!("bridge: contacts page at {CONTACTS_URL}");
+    let auth_api = Router::new()
+        .route("/auth/phone", post(phone))
+        .route("/auth/code", post(code))
+        .route("/auth/password", post(password))
+        .with_state(auth);
+    let pages = Router::new()
+        .route("/app", get(mini_page))
+        .route("/contacts", get(mini_page).post(add_contact))
+        .with_state(MiniHub { link });
+    let app = Router::new().merge(auth_api).merge(pages);
+    eprintln!("bridge: mini app at {MINI_APP_URL}");
     axum_server::bind_rustls(SocketAddr::from(([127, 0, 0, 1], 8788)), config)
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .map_err(|err| err.to_string())
 }
 
-async fn contacts_page(
+async fn mini_page(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(hub): State<MiniHub>,
 ) -> Result<axum::response::Html<&'static str>, axum::http::StatusCode> {
     if !from_loopback(addr) {
         return Err(axum::http::StatusCode::FORBIDDEN);
     }
-    Ok(axum::response::Html(contacts_page_html()))
+    if hub.link.borrow().is_some() {
+        Ok(axum::response::Html(contacts_page_html()))
+    } else {
+        Ok(axum::response::Html(page_html()))
+    }
 }
 
 async fn add_contact(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(hub): State<ContactsHub>,
+    State(hub): State<MiniHub>,
     Json(body): Json<ContactBody>,
 ) -> Result<Json<Value>, axum::http::StatusCode> {
     if !from_loopback(addr) {
         return Err(axum::http::StatusCode::FORBIDDEN);
+    }
+    if hub.link.borrow().is_none() {
+        return Ok(Json(json!({ "message": text::CONTACTS_NEED_SESSION })));
     }
     if let Some(message) = reject_contact_form(&body.name, &body.phone) {
         return Ok(Json(json!({ "message": message })));

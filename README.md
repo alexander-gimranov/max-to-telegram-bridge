@@ -57,12 +57,11 @@ Optional path variables: `MAX_VAR`, `MAX_ENV_PATH`, `MAX_SESSION_PATH`, `MAX_MAP
 
 1. Start the program.
 2. Open the bot in Telegram.
-3. When MAX is not signed in, select **Set up**, or send `/setup`.
-4. On this computer, open `http://127.0.0.1:8787`.
-5. Enter the phone number, then the code from the MAX call.
-6. When MAX asks for a cloud password, enter it.
+3. Select the mini app button: **Set up** when MAX is not signed in, or **Add contact** when the session is live. You can also send `/setup`.
+4. Enter the phone number, then the code from the MAX call.
+5. When MAX asks for a cloud password, enter it.
 
-The sign-in page accepts connections only from this computer. It listens on port `8787`. The labels in this section match `LANGUAGE=en`.
+The mini app runs on this computer at `https://127.0.0.1:8788/app`. Without a live MAX session it shows sign-in; with a live session it shows add-contact. A browser fallback for sign-in stays at `http://127.0.0.1:8787`. The labels in this section match `LANGUAGE=en`.
 
 PowerShell:
 
@@ -85,7 +84,7 @@ LANGUAGE=ru cargo run -p max-bridge --release
 
 `Thread` creates a Telegram topic for each MAX chat. Replies stay in that topic. History commands work only in this mode.
 
-In `Thread` mode the bot shows these controls after MAX is connected:
+In `Thread` mode the bot keeps a mini app button at all times: **Set up** without a live MAX session, **Add contact** when the session is live. After MAX is connected it also shows:
 
 - **Load history** (`/history`) writes chats that are not loaded yet.
 - **Reload history** (`/reread`) deletes the topics and loads them again.
@@ -99,8 +98,8 @@ When both services provide the file, photos, voice messages, and videos are copi
 
 Telegram bots cannot show native delivery ticks. The bridge uses reactions on your outbound messages:
 
-- ⏳ — MAX accepted the message (`sent`)
-- ✅ — delivered to the peer (`arrived`)
+- ⚡ — MAX accepted the message (`sent`)
+- 👍 — delivered to the peer (`arrived`)
 - 👀 — the peer read it in MAX (`read`)
 
 On an inbound message from MAX, add the 👀 reaction in Telegram to mark that message read in MAX. The bridge does not mark MAX messages read automatically when it forwards them.
