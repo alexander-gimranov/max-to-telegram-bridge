@@ -7,7 +7,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{decrypt_chrome, decrypt_with_key, decode_local_state_key};
+use crate::crypto::{decode_local_state_key, decrypt_chrome, decrypt_with_key};
 use crate::error::{Error, Result};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -124,7 +124,11 @@ fn extract_oneme(home: &Path) -> Option<Session> {
 
 fn device_id_from_logs(home: &Path) -> Option<String> {
     let dir = home.join(".local/share/ONEME/logs");
-    let mut files: Vec<PathBuf> = fs::read_dir(dir).ok()?.flatten().map(|entry| entry.path()).collect();
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
     files.sort_by_key(|path| {
         fs::metadata(path)
             .and_then(|meta| meta.modified())
@@ -297,12 +301,21 @@ fn looks_utf16(bytes: &[u8]) -> bool {
     if sample.len() < 20 {
         return false;
     }
-    let zeros = sample.iter().skip(1).step_by(2).filter(|byte| **byte == 0).count();
+    let zeros = sample
+        .iter()
+        .skip(1)
+        .step_by(2)
+        .filter(|byte| **byte == 0)
+        .count();
     zeros * 4 > sample.len()
 }
 
 fn decode_utf16_le(bytes: &[u8]) -> String {
-    let start = if bytes.starts_with(&[0xFF, 0xFE]) { 2 } else { 0 };
+    let start = if bytes.starts_with(&[0xFF, 0xFE]) {
+        2
+    } else {
+        0
+    };
     let units: Vec<u16> = bytes[start..]
         .chunks_exact(2)
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
@@ -326,7 +339,11 @@ fn nearest_pair(text: &str) -> Option<(usize, String, String)> {
             if distance > 8192 {
                 continue;
             }
-            if best.as_ref().map(|(old, _, _)| distance < *old).unwrap_or(true) {
+            if best
+                .as_ref()
+                .map(|(old, _, _)| distance < *old)
+                .unwrap_or(true)
+            {
                 best = Some((distance, device_id.clone(), token.clone()));
             }
         }
@@ -338,9 +355,9 @@ fn valid_device(value: &str) -> bool {
     let len = value.len();
     (8..=80).contains(&len)
         && !value.contains('*')
-        && value.chars().all(|ch| {
-            ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '+' | '/' | '=')
-        })
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '+' | '/' | '='))
 }
 
 fn valid_token(value: &str) -> bool {
@@ -508,10 +525,7 @@ fn hex_decode(text: &str) -> Vec<u8> {
 fn local_state_key(profile: &Path, passwords: &[Vec<u8>]) -> Option<[u8; 16]> {
     let raw = fs::read_to_string(profile.join("Local State")).ok()?;
     let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let encoded = value
-        .get("os_crypt")?
-        .get("encrypted_key")?
-        .as_str()?;
+    let encoded = value.get("os_crypt")?.get("encrypted_key")?.as_str()?;
     for password in passwords {
         if let Some(key) = decode_local_state_key(password, encoded) {
             return Some(key);
@@ -572,7 +586,11 @@ for secret in secrets.values():
         sys.stdout.buffer.write(raw)
         break
 "#;
-    let output = Command::new("python3").arg("-c").arg(script).output().ok()?;
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -648,10 +666,7 @@ for item, secret in secrets.items():
     raw = bytes(secret[2])
     sys.stdout.buffer.write(raw + b"\n")
 "#;
-    let output = Command::new("python3")
-        .arg("-c")
-        .arg(script)
-        .output();
+    let output = Command::new("python3").arg("-c").arg(script).output();
     let Ok(output) = output else {
         return Vec::new();
     };

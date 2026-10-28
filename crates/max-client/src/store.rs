@@ -105,7 +105,10 @@ impl Store {
     }
 
     fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let conn = self.conn.lock().map_err(|_| Error::Protocol("store lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| Error::Protocol("store lock poisoned".into()))?;
         f(&conn)
     }
 
@@ -227,9 +230,7 @@ impl Store {
                 )
                 .optional()?;
             Ok(match row {
-                Some(session)
-                    if !session.token.is_empty() && !session.device_id.is_empty() =>
-                {
+                Some(session) if !session.token.is_empty() && !session.device_id.is_empty() => {
                     Some(session)
                 }
                 _ => None,
@@ -293,8 +294,7 @@ impl Store {
             let tx = conn.unchecked_transaction()?;
             tx.execute("DELETE FROM names", [])?;
             {
-                let mut stmt =
-                    tx.prepare("INSERT INTO names(user_id, name) VALUES(?1, ?2)")?;
+                let mut stmt = tx.prepare("INSERT INTO names(user_id, name) VALUES(?1, ?2)")?;
                 for (user_id, name) in names {
                     if name.is_empty() {
                         continue;
@@ -307,10 +307,7 @@ impl Store {
         })
     }
 
-    pub fn merge_names_from_users(
-        &self,
-        users: &HashMap<i64, crate::models::User>,
-    ) -> Result<()> {
+    pub fn merge_names_from_users(&self, users: &HashMap<i64, crate::models::User>) -> Result<()> {
         let mut names = self.load_names()?;
         let mut changed = false;
         for user in users.values() {
@@ -429,15 +426,15 @@ impl Store {
             tx.execute("DELETE FROM links_tg", [])?;
             tx.execute("DELETE FROM links_max", [])?;
             {
-                let mut stmt = tx
-                    .prepare("INSERT INTO links_tg(tg_message, max_message) VALUES(?1, ?2)")?;
+                let mut stmt =
+                    tx.prepare("INSERT INTO links_tg(tg_message, max_message) VALUES(?1, ?2)")?;
                 for (tg, max) in &links.tg {
                     stmt.execute(params![tg, max])?;
                 }
             }
             {
-                let mut stmt = tx
-                    .prepare("INSERT INTO links_max(max_message, tg_message) VALUES(?1, ?2)")?;
+                let mut stmt =
+                    tx.prepare("INSERT INTO links_max(max_message, tg_message) VALUES(?1, ?2)")?;
                 for (max, tg) in &links.max {
                     stmt.execute(params![max, tg])?;
                 }
@@ -449,8 +446,7 @@ impl Store {
 
     pub fn load_topics(&self) -> HashMap<String, Topic> {
         self.with_conn(|conn| {
-            let mut stmt =
-                conn.prepare("SELECT key, thread_id, name, photo FROM topics")?;
+            let mut stmt = conn.prepare("SELECT key, thread_id, name, photo FROM topics")?;
             let rows = stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -589,9 +585,8 @@ impl Store {
                 }
             }
             {
-                let mut stmt = conn.prepare(
-                    "SELECT max_chat, max_message, mark FROM pending_marks ORDER BY id",
-                )?;
+                let mut stmt = conn
+                    .prepare("SELECT max_chat, max_message, mark FROM pending_marks ORDER BY id")?;
                 let rows = stmt.query_map([], |row| {
                     Ok(PendingMark {
                         max_chat: row.get(0)?,
@@ -823,7 +818,11 @@ mod tests {
         let path = temp_db("round");
         let store = Store::open(&path).unwrap();
         store
-            .write_session(&Session::signed_in("tok".into(), "dev".into(), "inst".into()))
+            .write_session(&Session::signed_in(
+                "tok".into(),
+                "dev".into(),
+                "inst".into(),
+            ))
             .unwrap();
         let mut links = Links::default();
         links.tg.insert(1, 2);
@@ -853,11 +852,7 @@ mod tests {
         fs::write(dir.join("names.json"), r#"{"7":"Маня Н"}"#).unwrap();
         fs::write(dir.join("contacts.json"), "[7,0]").unwrap();
         fs::write(dir.join("map.json"), r#"{"10":20}"#).unwrap();
-        fs::write(
-            dir.join("links.json"),
-            r#"{"tg":{"1":2},"max":{"2":1}}"#,
-        )
-        .unwrap();
+        fs::write(dir.join("links.json"), r#"{"tg":{"1":2},"max":{"2":1}}"#).unwrap();
         fs::write(
             dir.join("topics.json"),
             r#"{"1:9":{"thread_id":44,"name":"Маня Н","photo":true}}"#,
@@ -874,12 +869,19 @@ mod tests {
         let db = dir.join("max.db");
         let store = Store::open(&db).unwrap();
         assert_eq!(store.read_session().unwrap().unwrap().token, "legacy");
-        assert_eq!(store.load_names().unwrap().get(&7).map(String::as_str), Some("Маня Н"));
+        assert_eq!(
+            store.load_names().unwrap().get(&7).map(String::as_str),
+            Some("Маня Н")
+        );
         assert!(store.load_contacts().unwrap().contains(&7));
         assert_eq!(store.load_map().get(&10), Some(&20));
         assert_eq!(store.load_offset(), 99);
         assert_eq!(
-            store.load_receipts().inbound.get(&8).map(|item| item.max_message),
+            store
+                .load_receipts()
+                .inbound
+                .get(&8)
+                .map(|item| item.max_message),
             Some(42)
         );
         assert!(dir.join("session.json.bak").exists());

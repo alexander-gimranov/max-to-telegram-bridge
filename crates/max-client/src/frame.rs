@@ -132,9 +132,7 @@ fn json_to_msgpack(value: &Value) -> rmpv::Value {
             }
         }
         Value::String(text) => rmpv::Value::String(text.clone().into()),
-        Value::Array(items) => {
-            rmpv::Value::Array(items.iter().map(json_to_msgpack).collect())
-        }
+        Value::Array(items) => rmpv::Value::Array(items.iter().map(json_to_msgpack).collect()),
         Value::Object(map) => rmpv::Value::Map(
             map.iter()
                 .map(|(key, item)| {
@@ -169,7 +167,9 @@ fn group_count_bytes(value: &Value) -> Option<rmpv::Value> {
 
 fn binary_field(value: &Value, len: usize) -> Option<rmpv::Value> {
     let text = value.as_str()?;
-    let bytes = base64::engine::general_purpose::STANDARD.decode(text).ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .ok()?;
     if bytes.len() == len {
         Some(rmpv::Value::Binary(bytes))
     } else {

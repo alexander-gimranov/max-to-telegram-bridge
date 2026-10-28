@@ -69,6 +69,7 @@ pub struct Message {
     pub control: Option<ControlAttach>,
     pub time: i64,
     pub media: Vec<Media>,
+    pub specials: Vec<SpecialAttach>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,9 +87,49 @@ pub struct ControlAttach {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpecialAttach {
+    Contact {
+        name: String,
+        phone: Option<String>,
+    },
+    File {
+        name: String,
+        size: i64,
+    },
+    Sticker {
+        url: String,
+    },
+    Share {
+        url: String,
+        title: String,
+        description: String,
+    },
+    Call {
+        call_type: Option<String>,
+        hangup: Option<String>,
+        duration: Option<i64>,
+    },
+    Poll {
+        title: String,
+        answers: Vec<String>,
+    },
+    Keyboard {
+        labels: Vec<String>,
+    },
+    Unknown {
+        raw: Value,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Media {
-    Photo { url: String },
-    Voice { url: String, duration_ms: i64 },
+    Photo {
+        url: String,
+    },
+    Voice {
+        url: String,
+        duration_ms: i64,
+    },
     Video {
         video_id: i64,
         token: String,
@@ -100,7 +141,9 @@ pub enum Media {
 
 #[derive(Debug, Clone)]
 pub enum Attach {
-    Photo { token: String },
+    Photo {
+        token: String,
+    },
     Voice {
         audio_id: i64,
         token: String,
@@ -275,7 +318,10 @@ pub struct CodeChallenge {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodeStatus {
     Token(String),
-    Password { track_id: String, hint: Option<String> },
+    Password {
+        track_id: String,
+        hint: Option<String>,
+    },
     Unregistered,
 }
 
@@ -483,6 +529,15 @@ pub fn parse_message(payload: &Value) -> Option<Message> {
     if media.is_empty() && attach_kinds(body).iter().any(|kind| kind == "VIDEO") {
         eprintln!("bridge: message {id} video attachment has no videoId");
     }
+    let control = parse_control(body);
+    let specials = parse_specials(
+        body,
+        outer,
+        &text,
+        &media,
+        control.is_some(),
+        status.as_deref(),
+    );
     Some(Message {
         id,
         chat_id,
@@ -492,32 +547,26 @@ pub fn parse_message(payload: &Value) -> Option<Message> {
         cid,
         reply_to: reply_target(body),
         forward: forward_source(body),
-        control: parse_control(body),
+        control,
         time: json_i64(body.get("time")).unwrap_or(0),
         media,
+        specials,
     })
 }
 
 fn parse_control(body: &serde_json::Map<String, Value>) -> Option<ControlAttach> {
-    let items = body.get("attaches").and_then(Value::as_array)?;
-    for item in items {
-        let obj = item.as_object()?;
-        if attach_kind(obj) != Some("CONTROL") {
+    for item in attach_items(body.get("attaches")) {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let kind = attach_kind(obj).map(str::to_ascii_uppercase);
+        if kind.as_deref() != Some("CONTROL") {
             continue;
         }
         return Some(ControlAttach {
-            event: obj
-                .get("event")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            action: obj
-                .get("action")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            title: obj
-                .get("title")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
+            event: obj.get("event").and_then(Value::as_str).map(str::to_owned),
+            action: obj.get("action").and_then(Value::as_str).map(str::to_owned),
+            title: obj.get("title").and_then(Value::as_str).map(str::to_owned),
             chat_type: obj
                 .get("chatType")
                 .and_then(Value::as_str)
@@ -525,6 +574,310 @@ fn parse_control(body: &serde_json::Map<String, Value>) -> Option<ControlAttach>
         });
     }
     None
+}
+
+fn parse_specials(
+    body: &serde_json::Map<String, Value>,
+    outer: Option<&Value>,
+    text: &str,
+    media: &[Media],
+    has_control: bool,
+    status: Option<&str>,
+) -> Vec<SpecialAttach> {
+    let mut specials = special_list(&attach_values(body, outer));
+    specials.extend(nested_contacts(body));
+    if specials.is_empty()
+        && text.trim().is_empty()
+        && media.is_empty()
+        && !has_control
+        && status != Some("REMOVED")
+    {
+        if let Some(raw) = unexplained(body) {
+            specials.push(SpecialAttach::Unknown { raw });
+        }
+    }
+    specials
+}
+
+fn attach_values<'a>(
+    body: &'a serde_json::Map<String, Value>,
+    outer: Option<&'a Value>,
+) -> Vec<&'a Value> {
+    let direct = attach_items(body.get("attaches"));
+    if !direct.is_empty() {
+        return direct;
+    }
+    if let Some(forwarded) = forward_attaches(body) {
+        let items = attach_items(Some(forwarded));
+        if !items.is_empty() {
+            return items;
+        }
+    }
+    outer
+        .and_then(|value| value.as_object())
+        .map(|obj| attach_items(obj.get("attaches")))
+        .unwrap_or_default()
+}
+
+fn forward_attaches(body: &serde_json::Map<String, Value>) -> Option<&Value> {
+    let link = body.get("link")?.as_object()?;
+    if link.get("type").and_then(Value::as_str) != Some("FORWARD") {
+        return None;
+    }
+    link.get("message")?.as_object()?.get("attaches")
+}
+
+fn attach_items(attaches: Option<&Value>) -> Vec<&Value> {
+    match attaches {
+        Some(Value::Array(items)) => items.iter().collect(),
+        Some(item @ Value::Object(_)) => vec![item],
+        _ => Vec::new(),
+    }
+}
+
+fn special_list(items: &[&Value]) -> Vec<SpecialAttach> {
+    items
+        .iter()
+        .filter_map(|item| parse_special_item(item))
+        .collect()
+}
+
+fn parse_special_item(item: &Value) -> Option<SpecialAttach> {
+    let Some(obj) = item.as_object() else {
+        return Some(SpecialAttach::Unknown { raw: item.clone() });
+    };
+    let kind = attach_kind(obj).map(str::to_ascii_uppercase);
+    match kind.as_deref() {
+        Some("PHOTO" | "AUDIO" | "VIDEO" | "CONTROL") => None,
+        Some("CONTACT") => Some(SpecialAttach::Contact {
+            name: contact_card_name(obj),
+            phone: contact_phone(obj),
+        }),
+        Some("FILE") => Some(SpecialAttach::File {
+            name: str_field(obj, "name").unwrap_or_default(),
+            size: json_i64(obj.get("size")).unwrap_or(0),
+        }),
+        Some("STICKER") => Some(SpecialAttach::Sticker {
+            url: str_field(obj, "url").unwrap_or_default(),
+        }),
+        Some("SHARE") => Some(SpecialAttach::Share {
+            url: str_field(obj, "url").unwrap_or_default(),
+            title: str_field(obj, "title").unwrap_or_default(),
+            description: str_field(obj, "description").unwrap_or_default(),
+        }),
+        Some("CALL") => Some(SpecialAttach::Call {
+            call_type: str_field(obj, "callType"),
+            hangup: str_field(obj, "hangupType"),
+            duration: json_i64(obj.get("duration")),
+        }),
+        Some("POLL") => Some(SpecialAttach::Poll {
+            title: str_field(obj, "title").unwrap_or_default(),
+            answers: poll_answers(obj),
+        }),
+        Some("INLINE_KEYBOARD") => Some(SpecialAttach::Keyboard {
+            labels: keyboard_labels(obj),
+        }),
+        _ => Some(SpecialAttach::Unknown { raw: item.clone() }),
+    }
+}
+
+fn nested_contacts(body: &serde_json::Map<String, Value>) -> Vec<SpecialAttach> {
+    let mut found = Vec::new();
+    if body
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("CONTACT"))
+    {
+        found.extend(contact_value(&Value::Object(body.clone())));
+    }
+    for key in ["contact", "contactInfo", "sharedContact"] {
+        if let Some(value) = body.get(key) {
+            found.extend(contact_value(value));
+        }
+    }
+    if let Some(items) = body.get("elements").and_then(Value::as_array) {
+        for item in items {
+            let Some(obj) = item.as_object() else {
+                continue;
+            };
+            let kind = obj
+                .get("type")
+                .or_else(|| obj.get("_type"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if !kind.eq_ignore_ascii_case("CONTACT") {
+                continue;
+            }
+            let nested = obj.get("attributes").or_else(|| obj.get("contact"));
+            found.extend(contact_value(nested.unwrap_or(item)));
+        }
+    }
+    found
+}
+
+fn contact_value(value: &Value) -> Option<SpecialAttach> {
+    let Some(obj) = value.as_object() else {
+        return Some(SpecialAttach::Unknown { raw: value.clone() });
+    };
+    let name = contact_card_name(obj);
+    let phone = contact_phone(obj);
+    if name.is_empty() && phone.is_none() {
+        return Some(SpecialAttach::Unknown { raw: value.clone() });
+    }
+    Some(SpecialAttach::Contact { name, phone })
+}
+
+fn unexplained(body: &serde_json::Map<String, Value>) -> Option<Value> {
+    const ENVELOPE: &[&str] = &[
+        "id",
+        "chatId",
+        "sender",
+        "senderId",
+        "text",
+        "time",
+        "status",
+        "cid",
+        "type",
+        "options",
+        "reactionInfo",
+        "updateTime",
+        "zoom",
+        "stats",
+        "views",
+        "ttl",
+        "prevMessageId",
+        "link",
+        "elements",
+        "attaches",
+    ];
+    let mut extra = serde_json::Map::new();
+    for (key, value) in body {
+        if ENVELOPE.contains(&key.as_str()) || !worth_logging(value) {
+            continue;
+        }
+        extra.insert(key.clone(), value.clone());
+    }
+    if let Some(elements) = body.get("elements").filter(|value| worth_logging(value)) {
+        extra.insert("elements".to_owned(), elements.clone());
+    }
+    if let Some(link) = body.get("link").filter(|value| worth_logging(value)) {
+        let kind = link.get("type").and_then(Value::as_str).unwrap_or("");
+        if kind != "REPLY" && kind != "FORWARD" {
+            extra.insert("link".to_owned(), link.clone());
+        }
+    }
+    if extra.is_empty() {
+        None
+    } else {
+        Some(Value::Object(extra))
+    }
+}
+
+fn worth_logging(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(map) => !map.is_empty(),
+        Value::Bool(_) | Value::Number(_) => true,
+    }
+}
+
+fn contact_card_name(obj: &serde_json::Map<String, Value>) -> String {
+    if let Some(name) = str_field(obj, "name") {
+        return name;
+    }
+    let first = str_field(obj, "firstName").unwrap_or_default();
+    let last = str_field(obj, "lastName").unwrap_or_default();
+    format!("{first} {last}").trim().to_owned()
+}
+
+fn contact_phone(obj: &serde_json::Map<String, Value>) -> Option<String> {
+    phone_field(obj, "phone")
+        .or_else(|| phone_field(obj, "phoneNumber"))
+        .or_else(|| vcf_phone(obj))
+}
+
+fn phone_field(obj: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    let value = obj.get(key)?;
+    if let Some(text) = value.as_str() {
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        return Some(text.to_owned());
+    }
+    json_i64(Some(value)).map(|number| number.to_string())
+}
+
+fn vcf_phone(obj: &serde_json::Map<String, Value>) -> Option<String> {
+    for key in ["vcf", "vcfBody", "vcfInfo"] {
+        let Some(text) = obj.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        for line in text.lines() {
+            let Some((head, value)) = line.trim().split_once(':') else {
+                continue;
+            };
+            if head.split(';').next() != Some("TEL") {
+                continue;
+            }
+            let phone = value.trim();
+            if !phone.is_empty() {
+                return Some(phone.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn poll_answers(obj: &serde_json::Map<String, Value>) -> Vec<String> {
+    obj.get("answers")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.as_object()
+                        .and_then(|answer| str_field(answer, "text"))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn keyboard_labels(obj: &serde_json::Map<String, Value>) -> Vec<String> {
+    let mut labels = Vec::new();
+    let Some(keyboard) = obj.get("keyboard") else {
+        return labels;
+    };
+    let buttons = keyboard.get("buttons").unwrap_or(keyboard);
+    push_button_labels(&mut labels, buttons);
+    labels
+}
+
+fn push_button_labels(labels: &mut Vec<String>, value: &Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                push_button_labels(labels, item);
+            }
+        }
+        Value::Object(obj) => {
+            if let Some(text) = str_field(obj, "text") {
+                labels.push(text);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn str_field(obj: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    obj.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
 }
 
 fn parse_media(body: &serde_json::Map<String, Value>) -> Vec<Media> {
@@ -1017,7 +1370,10 @@ mod tests {
         assert_eq!(payload["chatId"], 9);
         assert_eq!(payload["message"]["text"], "hello");
         assert_eq!(payload["message"]["cid"], 100);
-        assert!(payload["message"]["attaches"].as_array().unwrap().is_empty());
+        assert!(payload["message"]["attaches"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         assert!(payload["message"].get("link").is_none());
         let reply = send_payload(
             9,
@@ -1169,13 +1525,16 @@ mod tests {
         let forward = message.forward.unwrap();
         assert_eq!(forward.sender, Some(4));
         assert_eq!(forward.name.as_deref(), Some("Аня Н"));
-        assert_eq!(message.media[0], Media::Video {
-            video_id: 8,
-            token: "v".into(),
-            video_type: Some(1),
-            source_chat: Some(99),
-            source_message: Some(3),
-        });
+        assert_eq!(
+            message.media[0],
+            Media::Video {
+                video_id: 8,
+                token: "v".into(),
+                video_type: Some(1),
+                source_chat: Some(99),
+                source_message: Some(3),
+            }
+        );
     }
 
     #[test]
@@ -1231,7 +1590,10 @@ mod tests {
                 {"id": 4, "names": [{"name": "Peer"}], "flags": 0}
             ]
         }));
-        assert_eq!(users.iter().map(|user| user.id).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(
+            users.iter().map(|user| user.id).collect::<Vec<_>>(),
+            vec![1]
+        );
         let mapped = parse_book(&json!({
             "contacts": {
                 "9": {"id": 9, "names": [{"name": "Ada"}], "flags": 512}
@@ -1350,7 +1712,10 @@ mod tests {
             "iconUrl": "https://i.oneme.ru/i?r=legacy"
         }))
         .unwrap();
-        assert_eq!(fallback.photo.as_deref(), Some("https://i.oneme.ru/i?r=legacy"));
+        assert_eq!(
+            fallback.photo.as_deref(),
+            Some("https://i.oneme.ru/i?r=legacy")
+        );
     }
 
     #[test]
@@ -1411,7 +1776,10 @@ mod tests {
 
     #[test]
     fn contact_add_splits_the_name_and_classifies_the_answer() {
-        assert_eq!(split_contact_name("  Иван Петров  "), ("Иван".into(), "Петров".into()));
+        assert_eq!(
+            split_contact_name("  Иван Петров  "),
+            ("Иван".into(), "Петров".into())
+        );
         assert_eq!(split_contact_name("Маня"), ("Маня".into(), String::new()));
         let named = add_contact_payload("+79990001122", "Иван", "Петров");
         assert_eq!(named["phone"], "+79990001122");
@@ -1437,18 +1805,12 @@ mod tests {
             contact_error_kind("user.not.found: missing"),
             ContactErrorKind::Missing
         );
-        assert_eq!(
-            contact_error_kind("not.found"),
-            ContactErrorKind::Missing
-        );
+        assert_eq!(contact_error_kind("not.found"), ContactErrorKind::Missing);
         assert_eq!(
             contact_error_kind("privacy.restricted"),
             ContactErrorKind::Privacy
         );
-        assert_eq!(
-            contact_error_kind("chat.denied"),
-            ContactErrorKind::Privacy
-        );
+        assert_eq!(contact_error_kind("chat.denied"), ContactErrorKind::Privacy);
         assert_eq!(contact_error_kind("proto.payload"), ContactErrorKind::Other);
     }
 
@@ -1462,5 +1824,173 @@ mod tests {
         let challenge = parse_code_challenge(&payload).unwrap();
         assert_eq!(challenge.wait_secs, 60);
         assert_eq!(challenge.code_length, 6);
+    }
+
+    #[test]
+    fn contact_card_keeps_name_and_phone() {
+        let message = parse_message(&json!({
+            "id": 4,
+            "chatId": 9,
+            "text": "",
+            "attaches": [{
+                "_type": "CONTACT",
+                "name": "Светлана",
+                "phone": "79179158935"
+            }]
+        }))
+        .unwrap();
+        assert!(message.media.is_empty());
+        assert_eq!(
+            message.specials,
+            vec![SpecialAttach::Contact {
+                name: "Светлана".into(),
+                phone: Some("79179158935".into()),
+            }]
+        );
+        let from_vcf = parse_message(&json!({
+            "id": 5,
+            "text": "",
+            "attaches": [{
+                "_type": "CONTACT",
+                "firstName": "Анна",
+                "lastName": "Иванова",
+                "vcfBody": "BEGIN:VCARD\nTEL;CELL:+79179158935\nEND:VCARD"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            from_vcf.specials,
+            vec![SpecialAttach::Contact {
+                name: "Анна Иванова".into(),
+                phone: Some("+79179158935".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn file_attach_is_a_special() {
+        let message = parse_message(&json!({
+            "id": 6,
+            "text": "",
+            "attaches": [{
+                "_type": "FILE",
+                "name": "notes.pdf",
+                "size": 2048
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            message.specials,
+            vec![SpecialAttach::File {
+                name: "notes.pdf".into(),
+                size: 2048,
+            }]
+        );
+    }
+
+    #[test]
+    fn unknown_attach_keeps_the_raw_json() {
+        let raw = json!({"_type": "WIDGET", "foo": 1});
+        let message = parse_message(&json!({
+            "id": 7,
+            "text": "",
+            "attaches": [raw, "nope"]
+        }))
+        .unwrap();
+        assert_eq!(
+            message.specials,
+            vec![
+                SpecialAttach::Unknown {
+                    raw: json!({"_type": "WIDGET", "foo": 1})
+                },
+                SpecialAttach::Unknown { raw: json!("nope") },
+            ]
+        );
+    }
+
+    #[test]
+    fn forwarded_contact_is_read_from_the_inner_message() {
+        let message = parse_message(&json!({
+            "id": 8,
+            "text": "",
+            "attaches": [],
+            "link": {
+                "type": "FORWARD",
+                "message": {
+                    "id": 3,
+                    "attaches": [{"_type": "CONTACT", "name": "Светлана", "phoneNumber": "89179158935"}]
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            message.specials,
+            vec![SpecialAttach::Contact {
+                name: "Светлана".into(),
+                phone: Some("89179158935".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn empty_message_is_not_a_special() {
+        let message = parse_message(&json!({"id": 1, "text": ""})).unwrap();
+        assert!(message.specials.is_empty());
+        assert!(message.media.is_empty());
+    }
+
+    #[test]
+    fn contact_object_and_extra_fields_are_kept() {
+        let card = parse_message(&json!({
+            "id": 2,
+            "text": "",
+            "attaches": {"_type": "CONTACT", "name": "Светлана", "phone": "79179158935"}
+        }))
+        .unwrap();
+        assert_eq!(
+            card.specials,
+            vec![SpecialAttach::Contact {
+                name: "Светлана".into(),
+                phone: Some("79179158935".into()),
+            }]
+        );
+        let nested = parse_message(&json!({
+            "id": 3,
+            "text": "",
+            "contact": {"name": "Светлана", "phone": "89179158935"}
+        }))
+        .unwrap();
+        assert_eq!(
+            nested.specials,
+            vec![SpecialAttach::Contact {
+                name: "Светлана".into(),
+                phone: Some("89179158935".into()),
+            }]
+        );
+        let wrapped = parse_message(&json!({
+            "chatId": 9,
+            "message": {"id": 4, "text": ""},
+            "attaches": [{"_type": "contact", "firstName": "Светлана", "phone": "79179158935"}]
+        }))
+        .unwrap();
+        assert_eq!(
+            wrapped.specials,
+            vec![SpecialAttach::Contact {
+                name: "Светлана".into(),
+                phone: Some("79179158935".into()),
+            }]
+        );
+        let unknown = parse_message(&json!({
+            "id": 5,
+            "text": "",
+            "widget": {"foo": 1}
+        }))
+        .unwrap();
+        assert_eq!(
+            unknown.specials,
+            vec![SpecialAttach::Unknown {
+                raw: json!({"widget": {"foo": 1}})
+            }]
+        );
     }
 }

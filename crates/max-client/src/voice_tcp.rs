@@ -62,11 +62,7 @@ impl VoiceLink {
 
     /// Wait for NOTIF_ATTACH (136) with matching videoId.
     /// Returns `true` if ready arrived, `false` if `timeout` elapsed.
-    pub async fn wait_video_ready(
-        &mut self,
-        video_id: i64,
-        timeout: Duration,
-    ) -> Result<bool> {
+    pub async fn wait_video_ready(&mut self, video_id: i64, timeout: Duration) -> Result<bool> {
         match tokio::time::timeout(timeout, async {
             loop {
                 let (_cmd, _seq, opcode, body) = read_frame(&mut self.stream).await?;
@@ -105,7 +101,15 @@ impl VoiceLink {
             self,
             64,
             send_request(
-                chat_id, text, cid, reply_to, audio_id, token, duration_ms, wave, photos,
+                chat_id,
+                text,
+                cid,
+                reply_to,
+                audio_id,
+                token,
+                duration_ms,
+                wave,
+                photos,
             ),
         )
         .await?;
@@ -131,15 +135,7 @@ impl VoiceLink {
             self,
             64,
             send_video_request(
-                chat_id,
-                text,
-                cid,
-                reply_to,
-                video_id,
-                token,
-                video_type,
-                thumbhash,
-                photos,
+                chat_id, text, cid, reply_to, video_id, token, video_type, thumbhash, photos,
             ),
         )
         .await?;
@@ -610,11 +606,9 @@ fn as_string(value: &rmpv::Value) -> Option<String> {
 
 fn as_i64(value: &rmpv::Value) -> Option<i64> {
     match value {
-        rmpv::Value::Integer(number) => number.as_i64().or_else(|| {
-            number
-                .as_u64()
-                .and_then(|item| i64::try_from(item).ok())
-        }),
+        rmpv::Value::Integer(number) => number
+            .as_i64()
+            .or_else(|| number.as_u64().and_then(|item| i64::try_from(item).ok())),
         rmpv::Value::String(text) => text.as_str().unwrap_or("").parse().ok(),
         rmpv::Value::Ext(1, bytes) => {
             let mut cursor = std::io::Cursor::new(bytes);
@@ -706,10 +700,7 @@ mod tests {
         let map = rmpv::Value::Map(vec![pair("ok", rmpv::Value::Boolean(true))]);
         rmpv::encode::write_value(&mut bytes, &map).unwrap();
         let value = decode_payload(&bytes).unwrap();
-        assert_eq!(
-            map_get(&value, "ok"),
-            Some(&rmpv::Value::Boolean(true))
-        );
+        assert_eq!(map_get(&value, "ok"), Some(&rmpv::Value::Boolean(true)));
         assert_eq!(skip_leading_ints(&[0x80]), 0);
     }
 }

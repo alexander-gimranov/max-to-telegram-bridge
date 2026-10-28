@@ -4,28 +4,41 @@ mod text;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use max_client::{
-    beat, beat_age, contact_error_kind, lookup_v4, Attach, ChatFace, Client, ContactErrorKind,
-    Cursor, Event, InReceipt, Links, Media, Message, OutReceipt, PendingMark, ReceiptStatus,
-    Receipts, SessionLink, Store, Topic,
+    beat, beat_age, contact_error_kind, lookup_v4, lookup_v4_all, max_beat, max_beat_age, Attach,
+    ChatFace, Client, ContactErrorKind, Cursor, Event, InReceipt, Links, Media, Message,
+    OutReceipt, PendingMark, ReceiptStatus, Receipts, SessionLink, SpecialAttach, Store, Topic,
 };
 use reqwest::multipart::{Form, Part};
 use reqwest::Client as Http;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 const TELEGRAM_HOST: &str = "api.telegram.org";
+static TELEGRAM_ADDR: AtomicUsize = AtomicUsize::new(0);
+static TELEGRAM_BEAT: AtomicU64 = AtomicU64::new(0);
+static ERRORS: AtomicU64 = AtomicU64::new(0);
+static ERRORS_TOLD: AtomicU64 = AtomicU64::new(0);
+static ALERT_CONSOLE: AtomicU64 = AtomicU64::new(0);
+static MAX_EXPECTED: AtomicBool = AtomicBool::new(false);
+static ERROR_LOG: Mutex<Option<std::fs::File>> = Mutex::new(None);
+static UNTYPED_LOG: Mutex<Option<std::fs::File>> = Mutex::new(None);
+static TELEGRAM_ABORT: Mutex<Option<tokio::task::AbortHandle>> = Mutex::new(None);
+static MAX_ABORT: Mutex<Option<tokio::task::AbortHandle>> = Mutex::new(None);
 const MAX_MEDIA_BYTES: usize = 20 * 1024 * 1024;
 const STALL_AFTER_SECS: u64 = 180;
+const WORKER_STALL_SECS: u64 = 90;
+const ERROR_ALERT: u64 = 100;
 // Telegram bots may only set reactions from the Bot API allowlist.
 const REACT_SENT: &str = "⚡";
 const REACT_ARRIVED: &str = "👍";
@@ -56,18 +69,146 @@ fn stalled(age: Option<u64>) -> bool {
     age.is_some_and(|age| age > STALL_AFTER_SECS)
 }
 
-fn watch_loop(stop: std::sync::mpsc::Receiver<()>, abort: tokio::task::AbortHandle) {
-    loop {
-        match stop.recv_timeout(Duration::from_secs(5)) {
-            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if stalled(beat_age()) {
-                    abort.abort();
-                    return;
-                }
+fn unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+fn note_telegram() {
+    TELEGRAM_BEAT.store(unix_secs(), Ordering::Relaxed);
+}
+
+fn telegram_age() -> Option<u64> {
+    let beat = TELEGRAM_BEAT.load(Ordering::Relaxed);
+    if beat == 0 {
+        None
+    } else {
+        Some(unix_secs().saturating_sub(beat))
+    }
+}
+
+fn expect_max(on: bool) {
+    MAX_EXPECTED.store(on, Ordering::Relaxed);
+    if on {
+        max_beat();
+    }
+}
+
+fn console_error(text: &str) {
+    eprintln!(": E-R-R-O-R {text}");
+}
+
+fn console_alert(text: &str) {
+    let now = unix_secs();
+    let prev = ALERT_CONSOLE.load(Ordering::Relaxed);
+    if now.saturating_sub(prev) < 60 {
+        return;
+    }
+    if ALERT_CONSOLE
+        .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        console_error(text);
+    }
+}
+
+fn alert_mark(count: u64) -> Option<u64> {
+    if count <= ERROR_ALERT {
+        None
+    } else {
+        Some((count / ERROR_ALERT) * ERROR_ALERT)
+    }
+}
+
+fn error_line(stamp: &str, source: &str, detail: &str) -> String {
+    format!("{stamp} {source} {}", redact_telegram(detail))
+}
+
+fn error_stamp(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let time = secs % 86_400;
+    let hour = time / 3_600;
+    let min = (time % 3_600) / 60;
+    let sec = time % 60;
+    let (year, month, day) = civil_date(days);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+fn civil_date(mut days: i64) -> (i64, u32, u32) {
+    days += 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let doe = (days - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let year = if month <= 2 { year + 1 } else { year };
+    (year, month, day)
+}
+
+fn record_error(source: &str, detail: &str) {
+    let line = error_line(&error_stamp(unix_secs()), source, detail);
+    ERRORS.fetch_add(1, Ordering::Relaxed);
+    let mut slot = ERROR_LOG.lock().unwrap_or_else(|err| err.into_inner());
+    if slot.is_none() {
+        let path = var_dir().join("errors.log");
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            Ok(file) => *slot = Some(file),
+            Err(err) => {
+                console_error(&format!("error log is not writable: {err}"));
+                return;
             }
         }
     }
+    if let Some(file) = slot.as_mut() {
+        let _ = writeln!(file, "{line}");
+        let _ = file.flush();
+    }
+}
+
+fn record_untyped(chat_id: i64, message_id: i64, raw: &Value) {
+    let line = untyped_line(unix_ms(), chat_id, message_id, raw);
+    let mut slot = UNTYPED_LOG.lock().unwrap_or_else(|err| err.into_inner());
+    if slot.is_none() {
+        let path = var_dir().join("untyped-msgs");
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            Ok(file) => *slot = Some(file),
+            Err(err) => {
+                eprintln!("bridge: untyped log is not writable: {err}");
+                return;
+            }
+        }
+    }
+    if let Some(file) = slot.as_mut() {
+        let _ = writeln!(file, "{line}");
+        let _ = file.flush();
+    }
+}
+
+fn untyped_line(time: i64, chat_id: i64, message_id: i64, raw: &Value) -> String {
+    json!({
+        "time": time,
+        "chatId": chat_id,
+        "messageId": message_id,
+        "attach": raw,
+    })
+    .to_string()
+}
+
+fn worker_down(age: Option<u64>) -> bool {
+    age.is_some_and(|age| age > WORKER_STALL_SECS)
 }
 
 fn guard(config: Config) -> Result<(), String> {
@@ -76,20 +217,84 @@ fn guard(config: Config) -> Result<(), String> {
         .build()
         .map_err(|err| err.to_string())?;
     beat();
+    note_telegram();
     let worker = runtime.spawn(run(config));
     let abort = worker.abort_handle();
-    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
-    let watcher = thread::spawn(move || watch_loop(stop_rx, abort));
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| runtime.block_on(worker)));
-    drop(stop_tx);
-    let _ = watcher.join();
-    drop(runtime);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| runtime.block_on(worker)));
+        drop(runtime);
+        let _ = done_tx.send(outcome);
+    });
+    watch_workers(done_rx, abort)
+}
+
+fn watch_workers(
+    done: std::sync::mpsc::Receiver<
+        std::thread::Result<Result<Result<(), String>, tokio::task::JoinError>>,
+    >,
+    abort: tokio::task::AbortHandle,
+) -> Result<(), String> {
+    loop {
+        match done.recv_timeout(Duration::from_secs(5)) {
+            Ok(outcome) => return finish_run(outcome),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("runtime stopped".into());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if stalled(beat_age()) {
+                    console_error("event loop stalled; restarting");
+                    abort.abort();
+                    continue;
+                }
+                supervise();
+            }
+        }
+    }
+}
+
+fn finish_run(
+    outcome: std::thread::Result<Result<Result<(), String>, tokio::task::JoinError>>,
+) -> Result<(), String> {
     match outcome {
         Ok(Ok(Ok(()))) => Ok(()),
         Ok(Ok(Err(err))) => Err(err),
         Ok(Err(err)) if err.is_cancelled() => Err("event loop stalled".into()),
         Ok(Err(_)) => Err("task panicked".into()),
         Err(_) => Err("runtime panicked".into()),
+    }
+}
+
+fn supervise() {
+    let telegram_stalled = worker_down(telegram_age());
+    let max_stalled = MAX_EXPECTED.load(Ordering::Relaxed) && worker_down(max_beat_age());
+    if telegram_stalled {
+        record_error("telegram", "worker is not responding");
+        console_error("telegram is not responding; restarting");
+        note_telegram();
+        if let Some(handle) = TELEGRAM_ABORT
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+        {
+            handle.abort();
+        }
+    }
+    if max_stalled {
+        record_error("max", "worker is not responding");
+        console_error("MAX is not responding; restarting");
+        max_beat();
+        if let Some(handle) = MAX_ABORT
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+        {
+            handle.abort();
+        }
+    }
+    let count = ERRORS.load(Ordering::Relaxed);
+    if telegram_stalled && alert_mark(count).is_some() {
+        console_alert(&format!("bridge errors {count}, telegram is not connected"));
     }
 }
 
@@ -330,6 +535,8 @@ async fn max_event(client: Option<&mut Client>) -> Option<Event> {
 enum Wake {
     Max(Option<Event>),
     Telegram(Result<Vec<Update>, String>),
+    TelegramStopped,
+    Tick,
     Auth { changed: bool },
 }
 
@@ -468,6 +675,11 @@ fn set_client(
     published: &watch::Sender<Option<SessionLink>>,
     next: Option<Client>,
 ) {
+    if let Some(client) = next.as_ref() {
+        let mut abort = MAX_ABORT.lock().unwrap_or_else(|err| err.into_inner());
+        *abort = Some(client.abort_handle());
+        expect_max(true);
+    }
     let _ = published.send(next.as_ref().map(Client::link));
     *slot = next;
 }
@@ -484,6 +696,7 @@ async fn begin_logout(
     user_id: i64,
 ) {
     set_client(client, session_link, None);
+    expect_max(false);
     *link = LinkState::Off;
     *me = None;
     forget_session(&config.store);
@@ -542,6 +755,10 @@ async fn run(config: Config) -> Result<(), String> {
     });
     let mut http = telegram_http().await?;
     clear_reply_keyboard(&http, &config).await;
+    // getUpdates runs on its own task. The main thread only watches it.
+    let (mut offset_tx, mut poll_rx) = start_telegram(&config.token, offset);
+    let mut tick = tokio::time::interval(Duration::from_secs(30));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut client = None;
     let mut link = LinkState::Off;
     if config
@@ -561,6 +778,7 @@ async fn run(config: Config) -> Result<(), String> {
     let mut panels = HashMap::new();
     let mut logout_asks = HashMap::new();
     sync_controls(&http, &config, link, &mut panels).await;
+    eprintln!("bridge: listening");
     let mut me: Option<i64> = None;
     let mut echoes = HashSet::<i64>::new();
     loop {
@@ -576,15 +794,22 @@ async fn run(config: Config) -> Result<(), String> {
                     sync_controls(&http, &config, link, &mut panels).await;
                 }
                 Err(err) => {
+                    record_error("max", &err.to_string());
                     eprintln!("bridge: {err}");
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
                 }
             }
+        } else if client.is_none() {
+            expect_max(false);
         }
         let wake = tokio::select! {
             event = max_event(client.as_mut()) => Wake::Max(event),
-            polled = poll_telegram(&http, &config.token, offset) => Wake::Telegram(polled),
+            polled = poll_rx.recv() => match polled {
+                Some(result) => Wake::Telegram(result),
+                None => Wake::TelegramStopped,
+            },
+            _ = tick.tick() => Wake::Tick,
             changed = auth_notes.changed() => Wake::Auth { changed: changed.is_ok() },
         };
         match wake {
@@ -601,14 +826,21 @@ async fn run(config: Config) -> Result<(), String> {
                     }
                 }
             }
-            Wake::Telegram(Err(err)) => {
-                eprintln!("bridge: telegram poll failed: {err}");
-                tokio::time::sleep(Duration::from_secs(3)).await;
-                if let Ok(fresh) = telegram_http().await {
-                    http = fresh;
-                }
+            Wake::Tick => {
+                maybe_alert(&http, &config).await;
+            }
+            Wake::TelegramStopped => {
+                record_error("telegram", "poll task stopped");
+                console_error("telegram poll stopped; starting again");
+                let restarted = start_telegram(&config.token, offset);
+                offset_tx = restarted.0;
+                poll_rx = restarted.1;
+            }
+            Wake::Telegram(Err(_)) => {
+                maybe_alert(&http, &config).await;
             }
             Wake::Telegram(Ok(updates)) => {
+                let got_updates = !updates.is_empty();
                 for update in updates {
                     offset = update.update_id.saturating_add(1);
                     config.store.save_offset(offset);
@@ -633,6 +865,9 @@ async fn run(config: Config) -> Result<(), String> {
                     {
                         eprintln!("bridge: {err}");
                     }
+                }
+                if got_updates {
+                    let _ = offset_tx.send(offset);
                 }
             }
             Wake::Max(None) => {
@@ -659,14 +894,12 @@ async fn run(config: Config) -> Result<(), String> {
                         sync_controls(&http, &config, link, &mut panels).await;
                     }
                     if let Some(active) = client.as_mut() {
-                        if let Err(err) =
-                            flush_pending_marks(active, &config, &mut receipts).await
+                        if let Err(err) = flush_pending_marks(active, &config, &mut receipts).await
                         {
                             eprintln!("bridge: pending mark flush failed: {err}");
                         }
                         if let Err(err) =
-                            resync_out_receipts(active, &config, &mut http, &mut receipts, id)
-                                .await
+                            resync_out_receipts(active, &config, &mut http, &mut receipts, id).await
                         {
                             eprintln!("bridge: receipt resync failed: {err}");
                         }
@@ -693,11 +926,20 @@ async fn run(config: Config) -> Result<(), String> {
                 }
                 Event::Logged { note } => {
                     eprintln!("bridge: {note}");
+                    if note.contains("reconnecting") || session_rejected(&note) {
+                        record_error("max", &note);
+                        maybe_alert(&http, &config).await;
+                    }
                     if session_rejected(&note) {
+                        let tell = link != LinkState::Off;
+                        expect_max(false);
                         set_client(&mut client, &session_link, None);
                         link = LinkState::Off;
                         me = None;
                         sync_controls(&http, &config, link, &mut panels).await;
+                        if tell {
+                            notify_main(&http, &config, text::SESSION_REFRESH_FAILED).await;
+                        }
                     }
                 }
                 Event::Contact { dialog, name } => {
@@ -768,7 +1010,8 @@ async fn run(config: Config) -> Result<(), String> {
                     )
                     .await
                     {
-                        eprintln!("bridge: telegram send failed: {err}");
+                        eprintln!("bridge: telegram send failed");
+                        record_error("telegram", &err);
                         if let Ok(fresh) = telegram_http().await {
                             http = fresh;
                         }
@@ -991,9 +1234,10 @@ async fn handle_read_reaction(
     if !config.allowed.contains(&user.id) && !config.allowed.contains(&reaction.chat.id) {
         return Ok(());
     }
-    let eyes = reaction.new_reaction.iter().any(|item| {
-        item.kind == "emoji" && item.emoji.as_deref() == Some(REACT_READ)
-    });
+    let eyes = reaction
+        .new_reaction
+        .iter()
+        .any(|item| item.kind == "emoji" && item.emoji.as_deref() == Some(REACT_READ));
     if !eyes {
         return Ok(());
     }
@@ -1096,7 +1340,8 @@ async fn catch_up(
             )
             .await
             {
-                eprintln!("bridge: telegram send failed: {err}");
+                eprintln!("bridge: telegram send failed");
+                record_error("telegram", &err);
                 if let Ok(fresh) = telegram_http().await {
                     *http = fresh;
                 }
@@ -1201,6 +1446,7 @@ async fn forward_max(
             }
         }
     }
+    let mut caption_used_text = false;
     if !message.media.is_empty() {
         let label = topic_label(chat_id, &face, topic_sender);
         let topic_caption = if !bold_prefix.is_empty() {
@@ -1274,20 +1520,42 @@ async fn forward_max(
                 }
             }
             if sent_any || message.text.is_empty() {
-                return Ok(());
+                caption_used_text = sent_any && !message.text.trim().is_empty();
+                if message.specials.is_empty() {
+                    return Ok(());
+                }
             }
-        }
-        if message.text.is_empty() {
+        } else if message.text.is_empty() && message.specials.is_empty() {
             return Ok(());
         }
     }
-    let body = if !message.text.trim().is_empty() {
-        message.text.clone()
-    } else if let Some(body) = system_body(message) {
-        body
-    } else {
-        text::NO_TEXT.to_owned()
-    };
+    if !message.specials.is_empty() {
+        let lead = if caption_used_text {
+            ""
+        } else {
+            message.text.trim()
+        };
+        let label = topic_label(chat_id, &face, topic_sender);
+        return deliver_specials(
+            config,
+            http,
+            client,
+            map,
+            links,
+            receipts,
+            topics,
+            message,
+            chat_id,
+            &sender,
+            &title,
+            &bold_prefix,
+            &label,
+            lead,
+            history,
+        )
+        .await;
+    }
+    let body = plain_body(message);
     match config.mode {
         Mode::Chat => {
             let who = if !bold_prefix.is_empty() {
@@ -1312,6 +1580,7 @@ async fn forward_max(
                     message.id,
                     message.time,
                     &bold_prefix,
+                    None,
                 )
                 .await?;
             }
@@ -1345,6 +1614,7 @@ async fn forward_max(
                     &text,
                     reply_to,
                     &bold_prefix,
+                    None,
                 )
                 .await
                 {
@@ -1370,6 +1640,7 @@ async fn forward_max(
                         message.id,
                         message.time,
                         &bold_prefix,
+                        None,
                     )
                     .await?;
                 }
@@ -1377,6 +1648,186 @@ async fn forward_max(
         }
     }
     Ok(())
+}
+
+async fn deliver_specials(
+    config: &Config,
+    http: &mut Http,
+    client: &mut Client,
+    map: &mut HashMap<i64, i64>,
+    links: &mut Links,
+    receipts: &mut Receipts,
+    topics: &mut HashMap<String, Topic>,
+    message: &Message,
+    chat_id: i64,
+    sender: &str,
+    title: &str,
+    bold_prefix: &str,
+    label: &str,
+    lead: &str,
+    history: bool,
+) -> Result<(), String> {
+    for item in &message.specials {
+        if let SpecialAttach::Unknown { raw } = item {
+            record_untyped(chat_id, message.id, raw);
+        }
+    }
+    let head = special_head(config.mode, bold_prefix, sender, title);
+    if let Some(rich) = special_rich(&head, lead, &message.specials) {
+        let plain = clip(&special_plain(&head, lead, &message.specials), 4000);
+        relay_text(
+            config,
+            http,
+            client,
+            map,
+            links,
+            receipts,
+            topics,
+            message,
+            chat_id,
+            label,
+            &plain,
+            &head,
+            Some(rich),
+            history,
+        )
+        .await?;
+    } else if !lead.is_empty() {
+        let text = headed_text(config.mode, &head, lead);
+        relay_text(
+            config, http, client, map, links, receipts, topics, message, chat_id, label, &text,
+            &head, None, history,
+        )
+        .await?;
+    }
+    let unknown = unknown_values(&message.specials);
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let json_text = clip(&unknown_text(&unknown), 4000);
+    let shown = match config.mode {
+        Mode::Chat if !head.is_empty() => clip(&format!("{head}\n\n{json_text}"), 4000),
+        _ => json_text,
+    };
+    relay_text(
+        config, http, client, map, links, receipts, topics, message, chat_id, label, &shown, "",
+        None, history,
+    )
+    .await
+}
+
+async fn relay_text(
+    config: &Config,
+    http: &mut Http,
+    client: &mut Client,
+    map: &mut HashMap<i64, i64>,
+    links: &mut Links,
+    receipts: &mut Receipts,
+    topics: &mut HashMap<String, Topic>,
+    message: &Message,
+    chat_id: i64,
+    label: &str,
+    text: &str,
+    bold_prefix: &str,
+    rich: Option<Value>,
+    history: bool,
+) -> Result<(), String> {
+    match config.mode {
+        Mode::Chat => {
+            if chat_heading_missing(bold_prefix) {
+                eprintln!("bridge: contact name is missing for chat {chat_id}");
+            }
+            for user_id in &config.allowed {
+                send_feed(
+                    http,
+                    config,
+                    map,
+                    links,
+                    receipts,
+                    *user_id,
+                    text,
+                    chat_id,
+                    message.id,
+                    message.time,
+                    bold_prefix,
+                    rich.clone(),
+                )
+                .await?;
+            }
+        }
+        Mode::Thread => {
+            if label == "MAX" {
+                eprintln!("bridge: contact name is missing for chat {chat_id}");
+            }
+            let reply_to = message
+                .reply_to
+                .and_then(|max_id| links.max.get(&max_id).copied());
+            for user_id in &config.allowed {
+                if let Err(err) = send_in_topic(
+                    http,
+                    config,
+                    client,
+                    topics,
+                    links,
+                    receipts,
+                    *user_id,
+                    chat_id,
+                    message.id,
+                    message.time,
+                    label,
+                    text,
+                    reply_to,
+                    bold_prefix,
+                    rich.clone(),
+                )
+                .await
+                {
+                    if history {
+                        return Err(err);
+                    }
+                    eprintln!("bridge: topic send failed: {err}");
+                    send_feed(
+                        http,
+                        config,
+                        map,
+                        links,
+                        receipts,
+                        *user_id,
+                        text,
+                        chat_id,
+                        message.id,
+                        message.time,
+                        bold_prefix,
+                        rich.clone(),
+                    )
+                    .await?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn chat_heading_missing(prefix: &str) -> bool {
+    prefix == "MAX"
+}
+
+fn special_head(mode: Mode, bold_prefix: &str, sender: &str, title: &str) -> String {
+    if !bold_prefix.is_empty() {
+        return bold_prefix.to_owned();
+    }
+    if mode == Mode::Chat {
+        return chat_heading(sender, title);
+    }
+    String::new()
+}
+
+fn headed_text(mode: Mode, head: &str, body: &str) -> String {
+    match mode {
+        Mode::Chat if !head.is_empty() => clip(&format!("{head}\n\n{body}"), 4000),
+        Mode::Thread if !head.is_empty() => clip(&join_name(head, body), 4000),
+        _ => clip(body, 4000),
+    }
 }
 
 async fn send_feed(
@@ -1391,8 +1842,9 @@ async fn send_feed(
     max_message: i64,
     max_time: i64,
     bold_prefix: &str,
+    rich: Option<Value>,
 ) -> Result<(), String> {
-    let message_id = send_text(http, config, user_id, None, None, text, bold_prefix).await?;
+    let message_id = send_text(http, config, user_id, None, None, text, bold_prefix, rich).await?;
     note_telegram_message(
         config,
         map,
@@ -1421,6 +1873,7 @@ async fn send_in_topic(
     text: &str,
     reply_to: Option<i64>,
     bold_prefix: &str,
+    rich: Option<Value>,
 ) -> Result<(), String> {
     let name = topic_name(label);
     let key = topic_key(tg_user, max_chat);
@@ -1434,6 +1887,7 @@ async fn send_in_topic(
         text,
         reply_to,
         bold_prefix,
+        rich.clone(),
     )
     .await
     {
@@ -1451,6 +1905,7 @@ async fn send_in_topic(
                 text,
                 reply_to,
                 bold_prefix,
+                rich,
             )
             .await?
         }
@@ -1653,6 +2108,7 @@ async fn send_thread(
     text: &str,
     reply_to: Option<i64>,
     bold_prefix: &str,
+    rich: Option<Value>,
 ) -> Result<i64, String> {
     send_text(
         http,
@@ -1662,6 +2118,7 @@ async fn send_thread(
         reply_to,
         text,
         bold_prefix,
+        rich,
     )
     .await
 }
@@ -1674,8 +2131,9 @@ async fn send_text(
     reply_to: Option<i64>,
     text: &str,
     bold_prefix: &str,
+    rich: Option<Value>,
 ) -> Result<i64, String> {
-    if let Some(rich) = named_rich(bold_prefix, text) {
+    if let Some(rich) = rich.or_else(|| named_rich(bold_prefix, text)) {
         let mut body = json!({
             "chat_id": tg_user,
             "rich_message": rich,
@@ -2213,14 +2671,7 @@ fn note_telegram_message(
     }
     remember_link(links, tg_id, max_message);
     config.store.save_links(links);
-    remember_inbound(
-        receipts,
-        &config.store,
-        tg_id,
-        max_chat,
-        max_message,
-        time,
-    );
+    remember_inbound(receipts, &config.store, tg_id, max_chat, max_message, time);
 }
 
 fn image_mime(bytes: &[u8]) -> &'static str {
@@ -2324,6 +2775,286 @@ fn join_name(name: &str, body: &str) -> String {
     } else {
         format!("{name}\n\n{body}")
     }
+}
+
+fn special_rich(prefix: &str, lead: &str, specials: &[SpecialAttach]) -> Option<Value> {
+    let known: Vec<&SpecialAttach> = specials
+        .iter()
+        .filter(|item| is_known_special(item))
+        .collect();
+    if known.is_empty() {
+        return None;
+    }
+    let mut blocks: Vec<Vec<Value>> = Vec::new();
+    let lead = lead.trim();
+    if !prefix.is_empty() || !lead.is_empty() {
+        let mut parts = Vec::new();
+        if !prefix.is_empty() {
+            parts.push(json!({"type": "bold", "text": prefix}));
+        }
+        if !lead.is_empty() {
+            if !parts.is_empty() {
+                parts.push(json!("\n\n"));
+            }
+            parts.push(json!(lead));
+        }
+        blocks.push(parts);
+    }
+    for item in &known {
+        blocks.push(special_parts(item));
+    }
+    let anchor = known
+        .iter()
+        .rev()
+        .find_map(|item| special_line(item))
+        .map(|line| last_line(&line).to_owned())
+        .filter(|line| !line.is_empty())
+        .unwrap_or_else(|| {
+            if !lead.is_empty() {
+                last_line(lead).to_owned()
+            } else {
+                prefix.to_owned()
+            }
+        });
+    let pad = clock_pad(&anchor);
+    if !pad.is_empty() {
+        if let Some(last) = blocks.last_mut() {
+            last.push(json!(pad));
+        }
+    }
+    let blocks: Vec<Value> = blocks
+        .into_iter()
+        .map(|text| json!({"type": "paragraph", "text": text}))
+        .collect();
+    Some(json!({"blocks": blocks}))
+}
+
+fn special_plain(prefix: &str, lead: &str, specials: &[SpecialAttach]) -> String {
+    let mut parts = Vec::new();
+    if !prefix.is_empty() {
+        parts.push(prefix.to_owned());
+    }
+    let lead = lead.trim();
+    if !lead.is_empty() {
+        parts.push(lead.to_owned());
+    }
+    for item in specials {
+        if let Some(line) = special_line(item) {
+            parts.push(line);
+        }
+    }
+    parts.join("\n\n")
+}
+
+fn special_parts(item: &SpecialAttach) -> Vec<Value> {
+    match item {
+        SpecialAttach::Contact { name, phone } => contact_parts(name, phone.as_deref()),
+        other => vec![json!(special_line(other).unwrap_or_default())],
+    }
+}
+
+fn contact_parts(name: &str, phone: Option<&str>) -> Vec<Value> {
+    let label = if name.is_empty() {
+        text::CONTACT_CARD.to_owned()
+    } else {
+        name.to_owned()
+    };
+    let mut parts = vec![json!({"type": "bold", "text": label})];
+    if let Some(phone) = phone {
+        let shown = format_phone(phone);
+        if !shown.is_empty() {
+            parts.push(json!("\n"));
+            parts.push(json!(shown));
+        }
+    }
+    parts
+}
+
+fn special_line(item: &SpecialAttach) -> Option<String> {
+    match item {
+        SpecialAttach::Contact { name, phone } => {
+            let label = if name.is_empty() {
+                text::CONTACT_CARD
+            } else {
+                name.as_str()
+            };
+            let mut line = label.to_owned();
+            if let Some(phone) = phone {
+                let shown = format_phone(phone);
+                if !shown.is_empty() {
+                    line.push('\n');
+                    line.push_str(&shown);
+                }
+            }
+            Some(line)
+        }
+        SpecialAttach::File { name, size } => {
+            let name = if name.is_empty() {
+                text::FILE_CARD.to_owned()
+            } else {
+                name.clone()
+            };
+            if *size > 0 {
+                Some(format!("{name}\n{}", file_size(*size)))
+            } else {
+                Some(name)
+            }
+        }
+        SpecialAttach::Sticker { url } => {
+            if url.is_empty() {
+                Some(text::STICKER_CARD.to_owned())
+            } else {
+                Some(format!("{}\n{url}", text::STICKER_CARD))
+            }
+        }
+        SpecialAttach::Share {
+            url,
+            title,
+            description,
+        } => {
+            let mut lines = Vec::new();
+            if !title.is_empty() {
+                lines.push(title.clone());
+            }
+            if !description.is_empty() {
+                lines.push(description.clone());
+            }
+            if !url.is_empty() {
+                lines.push(url.clone());
+            }
+            if lines.is_empty() {
+                lines.push(text::LINK_CARD.to_owned());
+            }
+            Some(lines.join("\n"))
+        }
+        SpecialAttach::Call {
+            call_type,
+            hangup,
+            duration,
+        } => {
+            let mut parts = vec![call_kind(call_type.as_deref())];
+            if let Some(hangup) = hangup {
+                parts.push(call_hangup(hangup));
+            }
+            if let Some(duration) = duration {
+                let clock = call_clock(*duration);
+                if !clock.is_empty() {
+                    parts.push(clock);
+                }
+            }
+            Some(parts.join(" · "))
+        }
+        SpecialAttach::Poll { title, answers } => {
+            let mut lines = Vec::new();
+            if title.is_empty() {
+                lines.push(text::POLL_CARD.to_owned());
+            } else {
+                lines.push(title.clone());
+            }
+            for answer in answers {
+                lines.push(format!("• {answer}"));
+            }
+            Some(lines.join("\n"))
+        }
+        SpecialAttach::Keyboard { labels } => {
+            if labels.is_empty() {
+                Some(text::BUTTONS_CARD.to_owned())
+            } else {
+                Some(format!("{}\n{}", text::BUTTONS_CARD, labels.join(" · ")))
+            }
+        }
+        SpecialAttach::Unknown { .. } => None,
+    }
+}
+
+fn is_known_special(item: &SpecialAttach) -> bool {
+    !matches!(item, SpecialAttach::Unknown { .. })
+}
+
+fn unknown_values(specials: &[SpecialAttach]) -> Vec<&Value> {
+    specials
+        .iter()
+        .filter_map(|item| match item {
+            SpecialAttach::Unknown { raw } => Some(raw),
+            _ => None,
+        })
+        .collect()
+}
+
+fn unknown_text(items: &[&Value]) -> String {
+    let value = if items.len() == 1 {
+        items[0].clone()
+    } else {
+        Value::Array(items.iter().map(|item| (*item).clone()).collect())
+    };
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+}
+
+fn format_phone(raw: &str) -> String {
+    let digits: String = raw.chars().filter(|ch| ch.is_ascii_digit()).collect();
+    let national = if digits.len() == 11 && (digits.starts_with('7') || digits.starts_with('8')) {
+        Some(&digits[1..])
+    } else if digits.len() == 10 {
+        Some(digits.as_str())
+    } else {
+        None
+    };
+    let Some(national) = national else {
+        return raw.trim().to_owned();
+    };
+    format!(
+        "8 ({}) {}-{}-{}",
+        &national[0..3],
+        &national[3..6],
+        &national[6..8],
+        &national[8..10]
+    )
+}
+
+fn file_size(size: i64) -> String {
+    const KB: i64 = 1024;
+    const MB: i64 = 1024 * 1024;
+    const GB: i64 = 1024 * 1024 * 1024;
+    if size >= GB {
+        format!("{} GB", size / GB)
+    } else if size >= MB {
+        format!("{} MB", size / MB)
+    } else if size >= KB {
+        format!("{} KB", size / KB)
+    } else {
+        format!("{size} B")
+    }
+}
+
+fn call_kind(kind: Option<&str>) -> String {
+    match kind {
+        Some("AUDIO") => text::CALL_AUDIO.to_owned(),
+        Some("VIDEO") => text::CALL_VIDEO.to_owned(),
+        Some(other) if !other.is_empty() => other.to_owned(),
+        _ => text::CALL_CARD.to_owned(),
+    }
+}
+
+fn call_hangup(kind: &str) -> String {
+    match kind {
+        "MISSED" => text::CALL_MISSED.to_owned(),
+        "REJECTED" => text::CALL_REJECTED.to_owned(),
+        "CANCELED" => text::CALL_CANCELED.to_owned(),
+        "HUNGUP" => text::CALL_HUNGUP.to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+fn call_clock(duration: i64) -> String {
+    if duration <= 0 {
+        return String::new();
+    }
+    let secs = if duration >= 1000 {
+        duration / 1000
+    } else {
+        duration
+    };
+    format!("{}:{:02}", secs / 60, secs % 60)
 }
 
 #[cfg(test)]
@@ -2499,11 +3230,24 @@ fn history_body(message: &Message) -> String {
     if !message.media.is_empty() {
         return String::new();
     }
+    if !message.specials.is_empty() {
+        return String::new();
+    }
     if message.status.as_deref() == Some("REMOVED") {
         text::DELETED.to_owned()
     } else {
         text::NOT_FORWARDED.to_owned()
     }
+}
+
+fn plain_body(message: &Message) -> String {
+    if !message.text.trim().is_empty() {
+        return message.text.clone();
+    }
+    if let Some(body) = system_body(message) {
+        return body;
+    }
+    text::NO_TEXT.to_owned()
 }
 
 fn system_body(message: &Message) -> Option<String> {
@@ -2515,7 +3259,25 @@ fn system_body(message: &Message) -> Option<String> {
         .filter(|title| !title.is_empty());
     match (control.event.as_deref(), title) {
         (Some("new"), Some(title)) => Some(text::chat_created(title)),
-        _ => None,
+        _ => Some(control_line(control)),
+    }
+}
+
+fn control_line(control: &max_client::ControlAttach) -> String {
+    let mut parts = Vec::new();
+    for value in [
+        control.event.as_deref(),
+        control.action.as_deref(),
+        control.title.as_deref(),
+    ] {
+        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+            parts.push(value.to_owned());
+        }
+    }
+    if parts.is_empty() {
+        text::SYSTEM_EVENT.to_owned()
+    } else {
+        parts.join(" · ")
     }
 }
 
@@ -2930,6 +3692,36 @@ async fn load_all_history(
     Ok(())
 }
 
+async fn notify_main(http: &Http, config: &Config, text: &str) -> bool {
+    let mut sent = false;
+    for user_id in &config.allowed {
+        let body = json!({"chat_id": user_id, "text": text});
+        if telegram(http, &config.token, "sendMessage", body)
+            .await
+            .is_ok()
+        {
+            sent = true;
+        }
+    }
+    sent
+}
+
+async fn maybe_alert(http: &Http, config: &Config) {
+    let count = ERRORS.load(Ordering::Relaxed);
+    let Some(mark) = alert_mark(count) else {
+        return;
+    };
+    if ERRORS_TOLD.load(Ordering::Relaxed) >= mark {
+        return;
+    }
+    let text = format!("{} ({count})", text::ERROR_BUDGET);
+    if notify_main(http, config, &text).await {
+        ERRORS_TOLD.store(mark, Ordering::Relaxed);
+    } else {
+        console_alert(&format!("bridge errors {count}, telegram is not connected"));
+    }
+}
+
 async fn post_status(
     http: &Http,
     config: &Config,
@@ -3024,7 +3816,10 @@ async fn run_history(
         return Ok(());
     }
     post_status(http, config, tg_user, None, text::HISTORY_LOADING).await;
-    load_all_history(config, http, client, map, links, receipts, topics, seen, me, tg_user).await?;
+    load_all_history(
+        config, http, client, map, links, receipts, topics, seen, me, tg_user,
+    )
+    .await?;
     post_status(http, config, tg_user, None, text::HISTORY_DONE).await;
     Ok(())
 }
@@ -3206,9 +4001,7 @@ async fn handle_update(
         } else {
             "video"
         };
-        eprintln!(
-            "bridge: tg media {kind} file={file_id} video_type={video_type:?}"
-        );
+        eprintln!("bridge: tg media {kind} file={file_id} video_type={video_type:?}");
     }
     if text.is_empty() && photo_id.is_none() && voice.is_none() && video_clip.is_none() {
         return Ok(());
@@ -3306,7 +4099,13 @@ async fn handle_update(
                     let body = text.as_str();
                     (
                         send_video_on_tcp(
-                            client, chat_id, body, reply_to, &bytes, Some(0), attaches,
+                            client,
+                            chat_id,
+                            body,
+                            reply_to,
+                            &bytes,
+                            Some(0),
+                            attaches,
                         )
                         .await,
                         true,
@@ -3344,14 +4143,7 @@ async fn handle_update(
         }
         Err(err) if contact_error_kind(&err) == ContactErrorKind::Privacy => {
             eprintln!("bridge: {err}");
-            post_status(
-                http,
-                config,
-                from,
-                message.thread_id,
-                text::CONTACT_PRIVACY,
-            )
-            .await;
+            post_status(http, config, from, message.thread_id, text::CONTACT_PRIVACY).await;
             return Ok(());
         }
         Err(err) => return Err(err),
@@ -3442,18 +4234,178 @@ async fn incoming_attaches(
     attaches
 }
 
+fn start_telegram(
+    token: &str,
+    offset: i64,
+) -> (
+    watch::Sender<i64>,
+    mpsc::Receiver<Result<Vec<Update>, String>>,
+) {
+    let (offset_tx, offset_rx) = watch::channel(offset);
+    let (poll_tx, poll_rx) = mpsc::channel(4);
+    let token = token.to_owned();
+    tokio::spawn(async move {
+        telegram_supervisor(token, offset_rx, poll_tx).await;
+    });
+    (offset_tx, poll_rx)
+}
+
+async fn telegram_supervisor(
+    token: String,
+    offset_rx: watch::Receiver<i64>,
+    poll_tx: mpsc::Sender<Result<Vec<Update>, String>>,
+) {
+    loop {
+        note_telegram();
+        let task = tokio::spawn(telegram_poll_loop(
+            token.clone(),
+            offset_rx.clone(),
+            poll_tx.clone(),
+        ));
+        {
+            let mut slot = TELEGRAM_ABORT.lock().unwrap_or_else(|err| err.into_inner());
+            *slot = Some(task.abort_handle());
+        }
+        match task.await {
+            Ok(false) => return,
+            Ok(true) => {
+                record_error("telegram", "poll task stopped");
+                note_telegram();
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(err) if err.is_cancelled() => {
+                note_telegram();
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(_) => {
+                record_error("telegram", "poll task panicked");
+                note_telegram();
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+async fn telegram_poll_loop(
+    token: String,
+    mut offset_rx: watch::Receiver<i64>,
+    poll_tx: mpsc::Sender<Result<Vec<Update>, String>>,
+) -> bool {
+    let mut http = loop {
+        note_telegram();
+        match telegram_http().await {
+            Ok(http) => break http,
+            Err(err) => {
+                record_error("telegram", &err);
+                if poll_tx.send(Err(err)).await.is_err() {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        }
+    };
+    loop {
+        note_telegram();
+        let offset = *offset_rx.borrow_and_update();
+        let polled = poll_telegram(&http, &token, offset).await;
+        let failed = polled.is_err();
+        let pause = polled
+            .as_ref()
+            .err()
+            .map(|err| error_pause(err))
+            .unwrap_or(0);
+        let advanced = polled
+            .as_ref()
+            .ok()
+            .is_some_and(|updates| !updates.is_empty());
+        if failed {
+            if let Err(err) = &polled {
+                record_error("telegram", err);
+            }
+        }
+        if poll_tx.send(polled).await.is_err() {
+            return false;
+        }
+        if failed {
+            tokio::time::sleep(Duration::from_secs(pause)).await;
+            note_telegram();
+            if let Ok(fresh) = telegram_http().await {
+                http = fresh;
+            }
+            continue;
+        }
+        if advanced {
+            loop {
+                note_telegram();
+                tokio::select! {
+                    changed = offset_rx.changed() => {
+                        if changed.is_err() {
+                            return false;
+                        }
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                }
+            }
+        }
+    }
+}
+
+fn error_pause(err: &str) -> u64 {
+    if err.contains("502") {
+        5
+    } else {
+        3
+    }
+}
+
 async fn telegram_http() -> Result<Http, String> {
-    let addr = lookup_v4(TELEGRAM_HOST, 443)
+    let addrs = lookup_v4_all(TELEGRAM_HOST, 443)
         .await
         .map_err(|err| err.to_string())?;
+    let index = TELEGRAM_ADDR.fetch_add(1, Ordering::Relaxed);
+    let addr = addrs[index % addrs.len()];
     Http::builder()
-        .resolve(TELEGRAM_HOST, SocketAddr::new(addr.ip(), 443))
-        .timeout(Duration::from_secs(40))
+        .resolve(TELEGRAM_HOST, addr)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(60))
+        .tcp_keepalive(Duration::from_secs(15))
+        .http1_only()
         .build()
         .map_err(|err| err.to_string())
 }
 
+fn http_failure(err: reqwest::Error) -> String {
+    let mut text = redact_telegram(&err.to_string());
+    let mut source = std::error::Error::source(&err);
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = std::error::Error::source(cause);
+    }
+    text
+}
+
+fn redact_telegram(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("/bot") {
+        let token_at = start + 4;
+        out.push_str(&rest[..token_at]);
+        let after = &rest[token_at..];
+        let end = after.find('/').unwrap_or(after.len());
+        if end == 0 {
+            break;
+        }
+        out.push('…');
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 async fn poll_telegram(http: &Http, token: &str, offset: i64) -> Result<Vec<Update>, String> {
+    note_telegram();
     beat();
     let url = format!("https://api.telegram.org/bot{token}/getUpdates");
     let allowed = serde_json::to_string(&["message", "callback_query", "message_reaction"])
@@ -3467,9 +4419,9 @@ async fn poll_telegram(http: &Http, token: &str, offset: i64) -> Result<Vec<Upda
         ])
         .send()
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(http_failure)?;
     let status = response.status();
-    let body: Value = response.json().await.map_err(|err| err.to_string())?;
+    let body: Value = response.json().await.map_err(http_failure)?;
     if status.as_u16() == 409 {
         return Err(
             "telegram getUpdates returned 409 Conflict: another bridge is already polling this bot"
@@ -3644,7 +4596,10 @@ async fn send_video_on_tcp(
     let started = std::time::Instant::now();
     eprintln!("bridge: max video send note=false bytes={}", bytes.len());
     let mut link = client.open_voice().await.map_err(|err| err.to_string())?;
-    eprintln!("bridge: video session open ms={}", started.elapsed().as_millis());
+    eprintln!(
+        "bridge: video session open ms={}",
+        started.elapsed().as_millis()
+    );
     let ticket = link
         .ticket_video(false)
         .await
@@ -3856,7 +4811,9 @@ fn upload_thumbhash(body: &str) -> Option<Vec<u8>> {
     while padded.len() % 4 != 0 {
         padded.push('=');
     }
-    base64::engine::general_purpose::STANDARD.decode(padded).ok()
+    base64::engine::general_purpose::STANDARD
+        .decode(padded)
+        .ok()
 }
 
 async fn upload_voice(
@@ -3958,7 +4915,11 @@ fn upload_error(body: &str) -> Option<String> {
     let code = value
         .get("error_code")
         .or_else(|| value.get("errorCode"))
-        .and_then(|item| item.as_str().map(str::to_owned).or_else(|| item.as_i64().map(|n| n.to_string())));
+        .and_then(|item| {
+            item.as_str()
+                .map(str::to_owned)
+                .or_else(|| item.as_i64().map(|n| n.to_string()))
+        });
     let failed = value.get("error").is_some()
         || value.get("errorCode").is_some()
         || value.get("error_code").is_some();
@@ -4087,9 +5048,9 @@ async fn telegram_file(
         .multipart(form)
         .send()
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(http_failure)?;
     let status = response.status();
-    let payload: Value = response.json().await.map_err(|err| err.to_string())?;
+    let payload: Value = response.json().await.map_err(http_failure)?;
     if !status.is_success() || payload.get("ok").and_then(Value::as_bool) != Some(true) {
         let description = payload
             .get("description")
@@ -4110,9 +5071,9 @@ async fn telegram(http: &Http, token: &str, method: &str, body: Value) -> Result
         .json(&body)
         .send()
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(http_failure)?;
     let status = response.status();
-    let payload: Value = response.json().await.map_err(|err| err.to_string())?;
+    let payload: Value = response.json().await.map_err(http_failure)?;
     if !status.is_success() || payload.get("ok").and_then(Value::as_bool) != Some(true) {
         let description = payload
             .get("description")
@@ -4319,6 +5280,30 @@ mod tests {
     }
 
     #[test]
+    fn telegram_errors_hide_the_bot_token() {
+        let raw = "error sending request for url (https://api.telegram.org/bot123:ABC/getUpdates?timeout=25)";
+        let hidden = redact_telegram(raw);
+        assert!(!hidden.contains("123:ABC"));
+        assert!(hidden.contains("/bot…/getUpdates"));
+        let line = error_line("2026-10-26T07:00:00Z", "telegram", raw);
+        assert!(!line.contains("123:ABC"));
+        assert!(line.starts_with("2026-10-26T07:00:00Z telegram "));
+    }
+
+    #[test]
+    fn error_budget_starts_after_one_hundred() {
+        assert_eq!(alert_mark(100), None);
+        assert_eq!(alert_mark(101), Some(100));
+        assert_eq!(alert_mark(250), Some(200));
+    }
+
+    #[test]
+    fn error_stamp_uses_utc() {
+        assert_eq!(error_stamp(0), "1970-01-01T00:00:00Z");
+        assert_eq!(civil_date(0), (1970, 1, 1));
+    }
+
+    #[test]
     fn flood_wait_is_read_from_the_telegram_error() {
         let err = "telegram sendRichMessage returned 429 Too Many Requests: Too Many Requests: retry after 10";
         assert_eq!(retry_after(err), Some(10));
@@ -4367,6 +5352,7 @@ mod tests {
             control: None,
             time: 0,
             media: Vec::new(),
+            specials: Vec::new(),
         };
         let dialog = Message {
             id: 1,
@@ -4380,6 +5366,7 @@ mod tests {
             control: None,
             time: 0,
             media: Vec::new(),
+            specials: Vec::new(),
         };
         assert!(forward_message(&favorites, Some(5)));
         assert!(!forward_message(&dialog, Some(5)));
@@ -4610,7 +5597,10 @@ mod tests {
         let mut receipts = Receipts::default();
         remember_inbound(&mut receipts, &store, 8, 55, 42, 100);
         let loaded = store.load_receipts();
-        assert_eq!(loaded.inbound.get(&8).map(|item| item.max_message), Some(42));
+        assert_eq!(
+            loaded.inbound.get(&8).map(|item| item.max_message),
+            Some(42)
+        );
         assert_eq!(loaded.inbound.get(&8).map(|item| item.max_chat), Some(55));
         let _ = fs::remove_dir_all(&dir);
     }
@@ -4740,6 +5730,7 @@ mod tests {
             control: None,
             time,
             media: Vec::new(),
+            specials: Vec::new(),
         }
     }
 
@@ -4796,7 +5787,10 @@ mod tests {
             history_chat_ids(&[0, 2], &seen, &topics, 7),
             vec![0, 2, 4, 9]
         );
-        assert_eq!(history_topic_ids(&[0, 2, 4, 9], &[9, 15]), vec![0, 2, 4, 9, 15]);
+        assert_eq!(
+            history_topic_ids(&[0, 2, 4, 9], &[9, 15]),
+            vec![0, 2, 4, 9, 15]
+        );
         let mut bare = sample(1, 10);
         bare.chat_id = None;
         let mut stamped = vec![bare];
@@ -4937,6 +5931,7 @@ mod tests {
             control: None,
             time: 1,
             media: Vec::new(),
+            specials: Vec::new(),
         };
         assert_eq!(history_body(&removed), text::DELETED);
         let file = Message {
@@ -4945,6 +5940,7 @@ mod tests {
             ..removed
         };
         assert_eq!(history_body(&file), text::NOT_FORWARDED);
+        assert_eq!(plain_body(&file), text::NO_TEXT);
         let created = Message {
             text: String::new(),
             control: Some(max_client::ControlAttach {
@@ -4953,10 +5949,57 @@ mod tests {
                 title: Some("Систэрс".into()),
                 chat_type: Some("CHAT".into()),
             }),
-            ..file
+            ..file.clone()
         };
         assert_eq!(history_body(&created), text::chat_created("Систэрс"));
         assert!(system_body(&created).is_some());
+        let contact = Message {
+            text: String::new(),
+            specials: vec![SpecialAttach::Contact {
+                name: "Светлана".into(),
+                phone: Some("79179158935".into()),
+            }],
+            ..file
+        };
+        assert_eq!(history_body(&contact), "");
+    }
+
+    #[test]
+    fn contact_card_is_a_rich_message() {
+        let rich = special_rich(
+            "",
+            "",
+            &[SpecialAttach::Contact {
+                name: "Светлана".into(),
+                phone: Some("79179158935".into()),
+            }],
+        )
+        .unwrap();
+        let parts = rich["blocks"][0]["text"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], "bold");
+        assert_eq!(parts[0]["text"], "Светлана");
+        assert_eq!(parts[1], "\n");
+        assert_eq!(parts[2], "8 (917) 915-89-35");
+        assert_eq!(format_phone("8 (917) 915-89-35"), "8 (917) 915-89-35");
+        assert_eq!(format_phone("+7 917 915-89-35"), "8 (917) 915-89-35");
+    }
+
+    #[test]
+    fn unknown_special_is_plain_json() {
+        let raw = json!({"_type": "WIDGET", "foo": 1});
+        let specials = [SpecialAttach::Unknown { raw: raw.clone() }];
+        assert!(special_rich("", "", &specials).is_none());
+        assert_eq!(
+            unknown_text(&unknown_values(&specials)),
+            serde_json::to_string_pretty(&raw).unwrap()
+        );
+        let line = untyped_line(15, 9, 4, &raw);
+        let logged: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(logged["time"], 15);
+        assert_eq!(logged["chatId"], 9);
+        assert_eq!(logged["messageId"], 4);
+        assert_eq!(logged["attach"], raw);
+        assert!(!line.contains(text::NO_TEXT));
     }
 
     #[test]
@@ -4983,7 +6026,9 @@ mod tests {
             ready["inline_keyboard"][0][0]["web_app"]["url"],
             auth_http::MINI_APP_URL
         );
-        assert!(ready["inline_keyboard"][0][0].get("callback_data").is_none());
+        assert!(ready["inline_keyboard"][0][0]
+            .get("callback_data")
+            .is_none());
         assert_eq!(ready["inline_keyboard"][1][0]["callback_data"], "history");
         assert_eq!(ready["inline_keyboard"][2][0]["callback_data"], "reread");
         assert_eq!(ready["inline_keyboard"][3][0]["callback_data"], "logout");

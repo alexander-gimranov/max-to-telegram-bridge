@@ -283,9 +283,10 @@ impl AuthHub {
             }
         };
         drop(auth);
-        if let Err(err) = inner
-            .store
-            .write_session(&Session::signed_in(saved, device_id, instance_id))
+        if let Err(err) =
+            inner
+                .store
+                .write_session(&Session::signed_in(saved, device_id, instance_id))
         {
             inner.reset();
             return failure_step(&err.to_string());
@@ -458,7 +459,9 @@ async fn add_contact(
     };
     match link.add_contact(body.phone.trim(), body.name.trim()).await {
         Ok(added) => Ok(Json(contacts_message(&added))),
-        Err(err) => Ok(Json(json!({ "message": contact_failure_text(&err.to_string()) }))),
+        Err(err) => Ok(Json(
+            json!({ "message": contact_failure_text(&err.to_string()) }),
+        )),
     }
 }
 

@@ -3,10 +3,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::ClientConfig;
 use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio_rustls::TlsConnector;
@@ -14,7 +14,7 @@ use tokio_rustls::TlsConnector;
 use crate::error::{Error, Result};
 use crate::frame::{
     decode_bin, encode_bin, json_i64, payload_error, request, AUTH, AUTH_LOGIN_CHECK_PASSWORD,
-    AUTH_REQUEST, CHAT_HISTORY, CHAT_INFO, CHAT_MARK, CHATS_LIST, CMD_ERROR, CMD_EVENT,
+    AUTH_REQUEST, CHATS_LIST, CHAT_HISTORY, CHAT_INFO, CHAT_MARK, CMD_ERROR, CMD_EVENT,
     CONTACT_ADD_BY_PHONE, CONTACT_INFO, LOGIN, MSG_DELIVERY, MSG_SEND, NOTIF_ATTACH, NOTIF_MARK,
     NOTIF_MESSAGE, PHOTO_UPLOAD, PING, SESSION_INIT, VIDEO_PLAY, VIDEO_UPLOAD,
 };
@@ -23,8 +23,8 @@ use crate::models::{
     auth_request_payload, history_payload, login_payload, mark_read_payload, me_id,
     mobile_handshake_payload, parse_added_contact, parse_book, parse_chats, parse_code_challenge,
     parse_code_status, parse_delivery_mark, parse_login_token, parse_message, parse_messages,
-    parse_read_mark, parse_users, send_payload, split_contact_name, sync_time, AddedContact, Attach,
-    Chat, ChatFace, CodeChallenge, CodeStatus, DeliveryMark, Message, Name, ReadMark, User,
+    parse_read_mark, parse_users, send_payload, split_contact_name, sync_time, AddedContact,
+    Attach, Chat, ChatFace, CodeChallenge, CodeStatus, DeliveryMark, Message, Name, ReadMark, User,
     VoiceTicket,
 };
 use crate::profile::Session;
@@ -35,9 +35,25 @@ const QUIET_FOR: Duration = Duration::from_secs(60);
 const CMD_WAIT: Duration = Duration::from_secs(90);
 const AUTH_HOST: &str = "api2.oneme.ru";
 static BEAT: AtomicU64 = AtomicU64::new(0);
+static MAX_BEAT: AtomicU64 = AtomicU64::new(0);
 
 pub fn beat() {
     BEAT.store(now_secs(), Ordering::Relaxed);
+}
+
+pub fn max_beat() {
+    let now = now_secs();
+    BEAT.store(now, Ordering::Relaxed);
+    MAX_BEAT.store(now, Ordering::Relaxed);
+}
+
+pub fn max_beat_age() -> Option<u64> {
+    let beat = MAX_BEAT.load(Ordering::Relaxed);
+    if beat == 0 {
+        None
+    } else {
+        Some(now_secs().saturating_sub(beat))
+    }
 }
 
 pub fn beat_age() -> Option<u64> {
@@ -142,6 +158,13 @@ pub struct Client {
     session: Session,
     voice_hold: Arc<AtomicBool>,
     voice_cids: Arc<Mutex<Vec<i64>>>,
+    abort: tokio::task::AbortHandle,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
 }
 
 impl Client {
@@ -154,22 +177,26 @@ impl Client {
         let (event_tx, events) = mpsc::channel(256);
         let hold = Arc::clone(&voice_hold);
         let cids = Arc::clone(&voice_cids);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
+            eprintln!("bridge: MAX client task started");
             if let Err(err) =
                 run_forever(session, store, cmd_rx, event_tx.clone(), hold, cids).await
             {
+                eprintln!("bridge: MAX client task stopped: {err}");
                 let note = Event::Logged {
                     note: err.to_string(),
                 };
                 let _ = tokio::time::timeout(Duration::from_secs(2), event_tx.send(note)).await;
             }
         });
+        let abort = task.abort_handle();
         Ok(Client {
             cmd_tx,
             events,
             session: saved,
             voice_hold,
             voice_cids,
+            abort,
         })
     }
 
@@ -184,6 +211,10 @@ impl Client {
 
     pub async fn next_event(&mut self) -> Option<Event> {
         self.events.recv().await
+    }
+
+    pub fn abort_handle(&self) -> tokio::task::AbortHandle {
+        self.abort.clone()
     }
 
     pub async fn send_text(
@@ -392,24 +423,24 @@ impl SessionLink {
 }
 
 async fn send_cmd(tx: &mpsc::Sender<Cmd>, cmd: Cmd) -> Result<()> {
-    beat();
+    max_beat();
     let result = match tokio::time::timeout(CMD_WAIT, tx.send(cmd)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(_)) => Err(Error::Protocol("MAX connection stopped".into())),
         Err(_) => Err(Error::Protocol("MAX request timed out".into())),
     };
-    beat();
+    max_beat();
     result
 }
 
 async fn wait_cmd<T>(rx: oneshot::Receiver<T>) -> Result<T> {
-    beat();
+    max_beat();
     let result = match tokio::time::timeout(CMD_WAIT, rx).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(_)) => Err(Error::Protocol("MAX connection stopped".into())),
         Err(_) => Err(Error::Protocol("MAX request timed out".into())),
     };
-    beat();
+    max_beat();
     result
 }
 
@@ -603,7 +634,7 @@ async fn run_forever(
     let mut attempt = 0u32;
     let mut queued = VecDeque::new();
     loop {
-        beat();
+        max_beat();
         match run_once(
             &mut session,
             &store,
@@ -623,7 +654,7 @@ async fn run_forever(
                     ));
                 }
                 while voice_hold.load(Ordering::SeqCst) {
-                    beat();
+                    max_beat();
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
                 attempt = attempt.saturating_add(1);
@@ -635,7 +666,7 @@ async fn run_forever(
                         note: format!("{err}; reconnecting"),
                     },
                 );
-                beat();
+                max_beat();
                 tokio::time::sleep(delay).await;
             }
         }
@@ -713,21 +744,15 @@ async fn run_once(
         &mut pending,
         &mut voices,
         LOGIN,
-        login_payload(
-            &session.token,
-            -1,
-            -1,
-            -1,
-            -1,
-            session.desktop,
-        ),
+        login_payload(&session.token, -1, -1, -1, -1, session.desktop),
         event_tx,
     )
     .await?;
     if let Some(err) = payload_error(&logged) {
         return Err(Error::Protocol(err));
     }
-    let me = me_id(&logged).ok_or_else(|| Error::Protocol("login did not return a profile".into()))?;
+    let me =
+        me_id(&logged).ok_or_else(|| Error::Protocol("login did not return a profile".into()))?;
     if let Some(token) = logged.get("token").and_then(Value::as_str) {
         if !token.is_empty() {
             session.token = token.to_owned();
@@ -758,8 +783,7 @@ async fn run_once(
         None => "missing".to_owned(),
         Some(value) => value_brief(value),
     };
-    let chat_marker = json_i64(logged.get("chatMarker"))
-        .or_else(|| json_i64(logged.get("marker")));
+    let chat_marker = json_i64(logged.get("chatMarker")).or_else(|| json_i64(logged.get("marker")));
     let login_shape = logged
         .as_object()
         .map(|obj| {
@@ -817,7 +841,7 @@ async fn run_once(
     let mut last_rx = tokio::time::Instant::now();
 
     loop {
-        beat();
+        max_beat();
         flush_events(event_tx, queued);
         if let Ok(mut extra) = voice_cids.lock() {
             for cid in extra.drain(..) {
@@ -1180,7 +1204,7 @@ async fn fill_chats(
     let mut marker = now_ms();
     let mut seen_pages = HashSet::new();
     for _ in 0..50 {
-        beat();
+        max_beat();
         let payload = match roundtrip(
             link,
             pending,
@@ -1276,11 +1300,7 @@ fn unstarted_dialogs(chats: &HashMap<i64, Chat>, contacts: &[i64], me: i64) -> V
     ids
 }
 
-fn cached_contact<'a>(
-    users: &'a HashMap<i64, User>,
-    me: i64,
-    chat_id: i64,
-) -> Option<&'a User> {
+fn cached_contact<'a>(users: &'a HashMap<i64, User>, me: i64, chat_id: i64) -> Option<&'a User> {
     users
         .get(&dialog_id(me, chat_id))
         .or_else(|| users.get(&chat_id))
@@ -1357,9 +1377,8 @@ fn voice_ticket(payload: &Value) -> Result<VoiceTicket> {
         .and_then(Value::as_str)
         .filter(|url| !url.is_empty())
         .ok_or_else(|| Error::Protocol("MAX voice upload did not return a url".into()))?;
-    let audio_id = crate::frame::json_i64(info.get("videoId")).ok_or_else(|| {
-        Error::Protocol("MAX voice upload did not return an id".into())
-    })?;
+    let audio_id = crate::frame::json_i64(info.get("videoId"))
+        .ok_or_else(|| Error::Protocol("MAX voice upload did not return an id".into()))?;
     let token = info
         .get("token")
         .and_then(Value::as_str)
@@ -1575,7 +1594,9 @@ fn stored_chat_photo(chat: &Chat, users: &HashMap<i64, User>, me: i64) -> Option
         return clean_photo(chat.photo.clone());
     }
     let peer = chat.peers.iter().copied().find(|id| *id != me)?;
-    users.get(&peer).and_then(|user| clean_photo(user.photo.clone()))
+    users
+        .get(&peer)
+        .and_then(|user| clean_photo(user.photo.clone()))
 }
 
 fn chat_face(
@@ -1618,10 +1639,7 @@ fn is_group(chat: &Chat) -> bool {
     match chat.kind.as_str() {
         "CHAT" | "CHANNEL" => true,
         "DIALOG" => false,
-        _ => chat
-            .title
-            .as_ref()
-            .is_some_and(|title| !title.is_empty()),
+        _ => chat.title.as_ref().is_some_and(|title| !title.is_empty()),
     }
 }
 
@@ -1674,11 +1692,7 @@ fn finish_waiter(
             let name = cached_name(users, user_id).unwrap_or_default();
             let _ = reply.send(name);
         }
-        Waiter::Face {
-            chat_id,
-            me,
-            reply,
-        } => {
+        Waiter::Face { chat_id, me, reply } => {
             if failed.is_none() {
                 for chat in parse_chats(payload) {
                     remember_chat(chats, chat);
@@ -1811,7 +1825,7 @@ async fn roundtrip(
     let seq = send_frame(link, pending, opcode, payload, Waiter::Ignore).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        beat();
+        max_beat();
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             pending.remove(&seq);
@@ -1871,7 +1885,9 @@ async fn roundtrip(
 
 async fn connect() -> Result<Link> {
     let addr = lookup_v4(AUTH_HOST, 443).await?;
-    let tcp = TcpStream::connect(addr).await?;
+    let tcp = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr))
+        .await
+        .map_err(|_| Error::Protocol(format!("MAX connect to {addr} timed out")))??;
     tcp.set_nodelay(true)?;
     let connector = TlsConnector::from(Arc::new(tls_config()));
     let name = ServerName::try_from(AUTH_HOST)
@@ -1916,10 +1932,22 @@ const RUSSIAN_TRUSTED_SUB_CA: &[u8] = include_bytes!("../certs/russian_trusted_s
 const RUSSIAN_TRUSTED_ROOT_CA: &[u8] = include_bytes!("../certs/russian_trusted_root_ca.der");
 
 pub async fn lookup_v4(host: &str, port: u16) -> Result<std::net::SocketAddr> {
-    let mut addrs = tokio::net::lookup_host((host, port)).await?;
-    addrs
-        .find(|addr| addr.is_ipv4())
-        .ok_or_else(|| Error::Protocol(format!("{host} has no IPv4 address")))
+    let mut found = lookup_v4_all(host, port).await?;
+    Ok(found.remove(0))
+}
+
+pub async fn lookup_v4_all(host: &str, port: u16) -> Result<Vec<std::net::SocketAddr>> {
+    let addrs = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    .map_err(|_| Error::Protocol(format!("{host} lookup timed out")))??;
+    let found: Vec<_> = addrs.filter(|addr| addr.is_ipv4()).collect();
+    if found.is_empty() {
+        return Err(Error::Protocol(format!("{host} has no IPv4 address")));
+    }
+    Ok(found)
 }
 
 fn now_ms() -> i64 {
@@ -2016,10 +2044,7 @@ mod tests {
         let synced = login_payload("t", 4, 0, 1, 2, false);
         assert_eq!(synced["contactsSync"], 0);
         assert_eq!(synced["chatsSync"], 4);
-        assert_eq!(
-            chat_face(&HashMap::new(), &users, 5, quiet).label,
-            "Маня Н"
-        );
+        assert_eq!(chat_face(&HashMap::new(), &users, 5, quiet).label, "Маня Н");
         assert_eq!(
             unstarted_dialogs(&chats, &[8, 5, 20], 5),
             vec![dialog_id(5, 20)]
