@@ -35,6 +35,8 @@ mod lang {
     pub const LOGOUT_ASK: &str = "Delete the loaded messages?";
     pub const HISTORY_NEEDS_THREAD: &str =
         "History for every contact is written into topics. Set MODE to Thread.";
+    pub const HISTORY_NOT_READY: &str =
+        "MAX is not connected yet. Wait until the panel is ready, then try again.";
     pub const HISTORY_LOADING: &str = "Loading history for every contact.";
     pub const HISTORY_DONE: &str = "History loaded.";
     pub const HISTORY_LOADING_TOPIC: &str = "Loading history for this chat.";
@@ -121,6 +123,8 @@ mod lang {
     pub const LOGOUT_ASK: &str = "Удалить загруженные сообщения?";
     pub const HISTORY_NEEDS_THREAD: &str =
         "История всех контактов пишется в темы. Включите режим Thread.";
+    pub const HISTORY_NOT_READY: &str =
+        "MAX ещё не подключён. Дождитесь готовности панели и нажмите снова.";
     pub const HISTORY_LOADING: &str = "Загружаю историю всех контактов.";
     pub const HISTORY_DONE: &str = "История загружена.";
     pub const HISTORY_LOADING_TOPIC: &str = "Загружаю историю этого чата.";

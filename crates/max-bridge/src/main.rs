@@ -451,6 +451,19 @@ fn history_allowed(link: LinkState) -> bool {
     link == LinkState::Ready
 }
 
+async fn refuse_history(
+    http: &Http,
+    config: &Config,
+    link: LinkState,
+    panels: &mut HashMap<i64, i64>,
+    tg_user: i64,
+    status_thread: Option<i64>,
+) {
+    eprintln!("bridge: history refused while MAX is {link:?}");
+    sync_controls(http, config, link, panels).await;
+    post_status(http, config, tg_user, status_thread, text::HISTORY_NOT_READY).await;
+}
+
 fn is_setup_command(text: &str) -> bool {
     let text = text.trim().to_lowercase();
     text == "/setup" || text.starts_with("/setup@") || text == text::SETUP.to_lowercase()
@@ -3845,6 +3858,40 @@ async fn handle_update(
         return handle_read_reaction(config, http, client, receipts, reaction).await;
     }
     if let Some(callback) = &update.callback {
+        let action = callback.data.as_deref();
+        if !config.allowed.contains(&callback.from.id) {
+            let _ = telegram(
+                http,
+                &config.token,
+                "answerCallbackQuery",
+                json!({"callback_query_id": callback.id}),
+            )
+            .await;
+            return Ok(());
+        }
+        let user_id = callback.from.id;
+        let status_thread = callback.message.as_ref().and_then(|message| {
+            message
+                .thread_id
+                .filter(|thread| topic_chat(topics, user_id, *thread).is_some())
+        });
+        if matches!(action, Some("history") | Some("reread"))
+            && (!history_allowed(*link) || client.is_none())
+        {
+            let _ = telegram(
+                http,
+                &config.token,
+                "answerCallbackQuery",
+                json!({
+                    "callback_query_id": callback.id,
+                    "text": text::HISTORY_NOT_READY,
+                    "show_alert": true,
+                }),
+            )
+            .await;
+            refuse_history(http, config, *link, panels, user_id, status_thread).await;
+            return Ok(());
+        }
         let _ = telegram(
             http,
             &config.token,
@@ -3852,11 +3899,6 @@ async fn handle_update(
             json!({"callback_query_id": callback.id}),
         )
         .await;
-        let action = callback.data.as_deref();
-        if !config.allowed.contains(&callback.from.id) {
-            return Ok(());
-        }
-        let user_id = callback.from.id;
         match action {
             Some("logout") => {
                 begin_logout(
@@ -3886,18 +3928,14 @@ async fn handle_update(
                 sync_controls(http, config, *link, panels).await;
                 return Ok(());
             }
-            Some("history") | Some("reread") if history_allowed(*link) => {}
+            Some("history") | Some("reread") => {}
             _ => return Ok(()),
         }
         let Some(active) = client.as_mut() else {
+            refuse_history(http, config, *link, panels, user_id, status_thread).await;
             return Ok(());
         };
         let reread = action == Some("reread");
-        let status_thread = callback.message.as_ref().and_then(|message| {
-            message
-                .thread_id
-                .filter(|thread| topic_chat(topics, user_id, *thread).is_some())
-        });
         return run_history(
             config,
             http,
@@ -3948,16 +3986,18 @@ async fn handle_update(
         return Ok(());
     }
     if is_history_command(&text) || is_reread_command(&text) {
-        if !history_allowed(*link) {
-            return Ok(());
-        }
-        let Some(active) = client.as_mut() else {
-            return Ok(());
-        };
-        let reread = is_reread_command(&text);
         let status_thread = message
             .thread_id
             .filter(|thread| topic_chat(topics, from, *thread).is_some());
+        if !history_allowed(*link) || client.is_none() {
+            refuse_history(http, config, *link, panels, from, status_thread).await;
+            return Ok(());
+        }
+        let Some(active) = client.as_mut() else {
+            refuse_history(http, config, *link, panels, from, status_thread).await;
+            return Ok(());
+        };
+        let reread = is_reread_command(&text);
         if let Some(thread_id) = stray_command_topic(message, topics, from) {
             if let Err(err) = delete_topic(http, config, from, thread_id).await {
                 eprintln!("bridge: history command topic delete failed: {err}");
@@ -6007,6 +6047,7 @@ mod tests {
         assert!(!history_allowed(LinkState::Off));
         assert!(!history_allowed(LinkState::Connecting));
         assert!(history_allowed(LinkState::Ready));
+        assert!(text::HISTORY_NOT_READY.contains("MAX"));
         let off = panel_markup(LinkState::Off);
         assert_eq!(off["inline_keyboard"][0][0]["text"], text::SETUP);
         assert_eq!(
