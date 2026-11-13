@@ -36,6 +36,7 @@ static UNTYPED_LOG: Mutex<Option<std::fs::File>> = Mutex::new(None);
 static TELEGRAM_ABORT: Mutex<Option<tokio::task::AbortHandle>> = Mutex::new(None);
 static MAX_ABORT: Mutex<Option<tokio::task::AbortHandle>> = Mutex::new(None);
 const MAX_MEDIA_BYTES: usize = 20 * 1024 * 1024;
+const PHOTO_DOWNLOAD_TRIES: u32 = 3;
 const STALL_AFTER_SECS: u64 = 180;
 const WORKER_STALL_SECS: u64 = 90;
 const ERROR_ALERT: u64 = 100;
@@ -794,6 +795,7 @@ async fn run(config: Config) -> Result<(), String> {
     eprintln!("bridge: listening");
     let mut me: Option<i64> = None;
     let mut echoes = HashSet::<i64>::new();
+    let mut pending_media = Vec::<Message>::new();
     loop {
         beat();
         if client.is_none() && config.store.read_session().ok().flatten().is_some() {
@@ -916,6 +918,24 @@ async fn run(config: Config) -> Result<(), String> {
                         {
                             eprintln!("bridge: receipt resync failed: {err}");
                         }
+                        let media_again = flush_pending_media(
+                            &config,
+                            &mut http,
+                            active,
+                            &mut map,
+                            &mut links,
+                            &mut receipts,
+                            &mut topics,
+                            me,
+                            &mut seen,
+                            &mut pending_media,
+                        )
+                        .await;
+                        if media_again > 0 {
+                            eprintln!(
+                                "bridge: sent {media_again} deferred media messages after reconnect"
+                            );
+                        }
                         match catch_up(
                             &config,
                             &mut http,
@@ -927,6 +947,7 @@ async fn run(config: Config) -> Result<(), String> {
                             me,
                             &mut seen,
                             &mut echoes,
+                            &mut pending_media,
                         )
                         .await
                         {
@@ -1023,10 +1044,15 @@ async fn run(config: Config) -> Result<(), String> {
                     )
                     .await
                     {
-                        eprintln!("bridge: telegram send failed");
-                        record_error("telegram", &err);
-                        if let Ok(fresh) = telegram_http().await {
-                            http = fresh;
+                        if media_deferred(&err) {
+                            eprintln!("bridge: {err}; will retry when MAX is live");
+                            note_pending_media(&mut pending_media, &message);
+                        } else {
+                            eprintln!("bridge: telegram send failed");
+                            record_error("telegram", &err);
+                            if let Ok(fresh) = telegram_http().await {
+                                http = fresh;
+                            }
                         }
                     } else {
                         mark_seen(&mut seen, &config.store, &message);
@@ -1281,6 +1307,73 @@ async fn handle_read_reaction(
     Ok(())
 }
 
+fn media_retryable(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("socket closed")
+        || lower.contains("connection is quiet")
+        || lower.contains("reconnect")
+        || lower.contains("not responding")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("broken pipe")
+        || lower.contains("connection reset")
+        || lower.contains("forcibly closed")
+}
+
+fn media_deferred(err: &str) -> bool {
+    err.starts_with("media deferred:")
+}
+
+fn note_pending_media(pending: &mut Vec<Message>, message: &Message) {
+    if pending.iter().any(|item| item.id == message.id) {
+        return;
+    }
+    pending.push(message.clone());
+}
+
+async fn flush_pending_media(
+    config: &Config,
+    http: &mut Http,
+    client: &mut Client,
+    map: &mut HashMap<i64, i64>,
+    links: &mut Links,
+    receipts: &mut Receipts,
+    topics: &mut HashMap<String, Topic>,
+    me: Option<i64>,
+    seen: &mut HashMap<i64, Cursor>,
+    pending: &mut Vec<Message>,
+) -> usize {
+    if pending.is_empty() {
+        return 0;
+    }
+    let batch = std::mem::take(pending);
+    let mut sent = 0usize;
+    for message in batch {
+        if !is_unseen(&message, cursor_of(seen, message.chat_id)) {
+            continue;
+        }
+        match forward_max(
+            config, http, client, map, links, receipts, topics, &message, me, false,
+        )
+        .await
+        {
+            Ok(()) => {
+                mark_seen(seen, &config.store, &message);
+                sent += 1;
+            }
+            Err(err) if media_deferred(&err) => {
+                eprintln!("bridge: {err}; keeping deferred media");
+                note_pending_media(pending, &message);
+            }
+            Err(err) => {
+                eprintln!("bridge: deferred media send failed: {err}");
+                note_pending_media(pending, &message);
+            }
+        }
+    }
+    sent
+}
+
 async fn catch_up(
     config: &Config,
     http: &mut Http,
@@ -1292,6 +1385,7 @@ async fn catch_up(
     me: Option<i64>,
     seen: &mut HashMap<i64, Cursor>,
     echoes: &mut HashSet<i64>,
+    pending_media: &mut Vec<Message>,
 ) -> Result<usize, String> {
     let mut chats = client.chat_ids().await.map_err(|err| err.to_string())?;
     for chat_id in seen.keys().copied() {
@@ -1353,6 +1447,11 @@ async fn catch_up(
             )
             .await
             {
+                if media_deferred(&err) {
+                    eprintln!("bridge: {err}; will retry when MAX is live");
+                    note_pending_media(pending_media, &message);
+                    continue;
+                }
                 eprintln!("bridge: telegram send failed");
                 record_error("telegram", &err);
                 if let Ok(fresh) = telegram_http().await {
@@ -1460,6 +1559,7 @@ async fn forward_max(
         }
     }
     let mut caption_used_text = false;
+    let mut photo_urls = Vec::new();
     if !message.media.is_empty() {
         let label = topic_label(chat_id, &face, topic_sender);
         let topic_caption = if !bold_prefix.is_empty() {
@@ -1479,10 +1579,31 @@ async fn forward_max(
             media_caption(Mode::Chat, false, &sender, &title, &message.text)
         };
         let mut files = Vec::new();
+        let mut deferred = None::<String>;
         for item in &message.media {
+            if let Media::Photo { url } = item {
+                match download_photo(url).await {
+                    Ok(bytes) => files.push((item, bytes)),
+                    Err(err) => {
+                        eprintln!("bridge: photo left as a url: {err}");
+                        photo_urls.push(url.clone());
+                    }
+                }
+                continue;
+            }
             match download_media(client, message, item).await {
                 Ok(bytes) => files.push((item, bytes)),
-                Err(err) => eprintln!("bridge: media download failed: {err}"),
+                Err(err) => {
+                    eprintln!("bridge: media download failed: {err}");
+                    if media_retryable(&err) {
+                        deferred = Some(err);
+                    }
+                }
+            }
+        }
+        if let Some(err) = deferred {
+            if files.len() + photo_urls.len() < message.media.len() {
+                return Err(format!("media deferred: {err}"));
             }
         }
         if !files.is_empty() {
@@ -1534,11 +1655,11 @@ async fn forward_max(
             }
             if sent_any || message.text.is_empty() {
                 caption_used_text = sent_any && !message.text.trim().is_empty();
-                if message.specials.is_empty() {
+                if message.specials.is_empty() && photo_urls.is_empty() {
                     return Ok(());
                 }
             }
-        } else if message.text.is_empty() && message.specials.is_empty() {
+        } else if message.text.is_empty() && message.specials.is_empty() && photo_urls.is_empty() {
             return Ok(());
         }
     }
@@ -1548,6 +1669,7 @@ async fn forward_max(
         } else {
             message.text.trim()
         };
+        let lead = photo_fallback_body(lead, &photo_urls);
         let label = topic_label(chat_id, &face, topic_sender);
         return deliver_specials(
             config,
@@ -1563,12 +1685,23 @@ async fn forward_max(
             &title,
             &bold_prefix,
             &label,
-            lead,
+            &lead,
             history,
         )
         .await;
     }
-    let body = plain_body(message);
+    let body = if photo_urls.is_empty() {
+        plain_body(message)
+    } else {
+        let lead = if caption_used_text {
+            String::new()
+        } else if !message.text.trim().is_empty() {
+            message.text.trim().to_owned()
+        } else {
+            system_body(message).unwrap_or_default()
+        };
+        photo_fallback_body(&lead, &photo_urls)
+    };
     match config.mode {
         Mode::Chat => {
             let who = if !bold_prefix.is_empty() {
@@ -3122,7 +3255,8 @@ async fn download_media(
     item: &Media,
 ) -> Result<Vec<u8>, String> {
     match item {
-        Media::Photo { url } | Media::Voice { url, .. } => download_public(url).await,
+        Media::Photo { url } => download_photo(url).await,
+        Media::Voice { url, .. } => download_public(url).await,
         Media::Video {
             video_id,
             source_chat,
@@ -3150,6 +3284,46 @@ async fn download_media(
             download_public(&url).await
         }
     }
+}
+
+async fn download_photo(url: &str) -> Result<Vec<u8>, String> {
+    let mut last = String::new();
+    for attempt in 1..=PHOTO_DOWNLOAD_TRIES {
+        beat();
+        match download_public(url).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(err) => {
+                eprintln!(
+                    "bridge: photo download failed ({attempt}/{PHOTO_DOWNLOAD_TRIES}): {err}"
+                );
+                last = err;
+                if attempt == PHOTO_DOWNLOAD_TRIES || !photo_download_again(&last) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+    Err(last)
+}
+
+fn photo_download_again(err: &str) -> bool {
+    !err.contains("larger than 20 MB") && !err.contains("not https") && !err.contains("no IPv4")
+}
+
+fn photo_fallback_body(text: &str, urls: &[String]) -> String {
+    let mut lines = Vec::new();
+    let text = text.trim();
+    if !text.is_empty() {
+        lines.push(text.to_owned());
+    }
+    for url in urls {
+        let url = url.trim();
+        if !url.is_empty() {
+            lines.push(url.to_owned());
+        }
+    }
+    lines.join("\n\n")
 }
 
 fn media_caption(mode: Mode, group: bool, sender: &str, title: &str, text: &str) -> String {
@@ -3322,6 +3496,10 @@ fn retry_after(err: &str) -> Option<u64> {
     let lower = err.to_ascii_lowercase();
     let rest = lower.split("retry after ").nth(1)?;
     rest.split_whitespace().next()?.parse().ok()
+}
+
+fn history_should_retry(err: &str) -> bool {
+    media_deferred(err) || retry_after(err).is_some()
 }
 
 async fn read_chat_history(client: &Client, chat_id: i64) -> Result<Vec<Message>, String> {
@@ -3579,11 +3757,10 @@ async fn load_topic_history(
                     break;
                 }
                 Err(err) => {
-                    if let Some(wait) = retry_after(&err) {
-                        if attempt < 2 {
-                            tokio::time::sleep(Duration::from_secs(wait.max(1))).await;
-                            continue;
-                        }
+                    if history_should_retry(&err) && attempt < 2 {
+                        let wait = retry_after(&err).unwrap_or(2).max(1);
+                        tokio::time::sleep(Duration::from_secs(wait)).await;
+                        continue;
                     }
                     eprintln!("bridge: history send failed: {err}");
                     if let Ok(fresh) = telegram_http().await {
@@ -5792,6 +5969,37 @@ mod tests {
         );
         assert!(!is_unseen(&sample(1, 100), Some(cursor)));
         assert!(is_unseen(&sample(9, 0), Some(Cursor { time: 0, id: 4 })));
+    }
+
+    #[test]
+    fn dropped_media_waits_for_a_live_max_socket() {
+        assert!(media_retryable("MAX socket closed"));
+        assert!(media_retryable("MAX connection is quiet"));
+        assert!(!media_retryable("telegram rejected the file"));
+        assert!(media_deferred("media deferred: MAX socket closed"));
+        assert!(!media_deferred("media download failed: 404"));
+        let mut pending = Vec::new();
+        note_pending_media(&mut pending, &sample(9, 10));
+        note_pending_media(&mut pending, &sample(9, 10));
+        assert_eq!(pending.len(), 1);
+        assert!(history_should_retry("media deferred: MAX socket closed"));
+    }
+
+    #[test]
+    fn photo_url_follows_three_download_failures() {
+        assert!(photo_download_again("media download failed"));
+        assert!(photo_download_again("media download failed: 404"));
+        assert!(!photo_download_again("media is larger than 20 MB"));
+        assert!(!photo_download_again("media url is not https"));
+        assert!(!photo_download_again("media host has no IPv4 address"));
+        assert_eq!(PHOTO_DOWNLOAD_TRIES, 3);
+        let url = "https://i.oneme.ru/i?r=photo".to_owned();
+        assert_eq!(photo_fallback_body("", &[url.clone()]), url);
+        assert_eq!(
+            photo_fallback_body("Фото", &[url.clone()]),
+            format!("Фото\n\n{url}")
+        );
+        assert_eq!(photo_fallback_body("  ", &[]), "");
     }
 
     #[test]
