@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -26,6 +26,9 @@ use time::{OffsetDateTime, UtcOffset};
 use tokio::sync::{mpsc, watch};
 
 const TELEGRAM_HOST: &str = "api.telegram.org";
+const IMAGE_HOST: &str = "i.oneme.ru";
+// Direct address of the photo host. Used only after the DNS name cannot be reached.
+const IMAGE_FALLBACK: Ipv4Addr = Ipv4Addr::new(155, 212, 205, 252);
 static TELEGRAM_ADDR: AtomicUsize = AtomicUsize::new(0);
 static TELEGRAM_BEAT: AtomicU64 = AtomicU64::new(0);
 static ERRORS: AtomicU64 = AtomicU64::new(0);
@@ -41,6 +44,9 @@ const PHOTO_DOWNLOAD_TRIES: u32 = 3;
 const SENDER_GAP: &str = "\u{2003}\u{2003}";
 const STALL_AFTER_SECS: u64 = 180;
 const WORKER_STALL_SECS: u64 = 90;
+// Photo and video uploads outlive the 60s client timeout.
+const TELEGRAM_FILE_SECS: u64 = 300;
+const TELEGRAM_CONNECT_SECS: u64 = 30;
 const ERROR_ALERT: u64 = 100;
 // Telegram bots may only set reactions from the Bot API allowlist.
 const REACT_SENT: &str = "⚡";
@@ -2380,6 +2386,11 @@ async fn send_text(
                         }
                         return Err(err);
                     }
+                    if attempt < 2 && telegram_connect_again(&err) {
+                        eprintln!("bridge: rich message failed, retrying: {err}");
+                        beat();
+                        continue;
+                    }
                     eprintln!("bridge: rich message failed: {err}");
                     break;
                 }
@@ -4708,9 +4719,11 @@ async fn telegram_http() -> Result<Http, String> {
     let addr = addrs[index % addrs.len()];
     Http::builder()
         .resolve(TELEGRAM_HOST, addr)
-        .connect_timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(TELEGRAM_CONNECT_SECS))
         .timeout(Duration::from_secs(60))
         .tcp_keepalive(Duration::from_secs(15))
+        // A reused socket is reported as connection reset (os error 10054).
+        .pool_max_idle_per_host(0)
         .http1_only()
         .build()
         .map_err(|err| err.to_string())
@@ -4799,14 +4812,29 @@ async fn download_public(raw: &str) -> Result<Vec<u8>, String> {
 }
 
 async fn public_http(host: &str, port: u16) -> Result<Http, String> {
-    let addr = lookup_v4(host, port)
-        .await
-        .map_err(|_| "media host has no IPv4 address".to_owned())?;
+    let addr = match lookup_v4(host, port).await {
+        Ok(addr) => addr,
+        Err(_) => match image_fallback(host, port) {
+            Some(addr) => {
+                eprintln!("bridge: {host} is unreachable, using {addr}");
+                addr
+            }
+            None => return Err("media host has no IPv4 address".into()),
+        },
+    };
     Http::builder()
         .resolve(host, SocketAddr::new(addr.ip(), port))
         .timeout(Duration::from_secs(60))
         .build()
         .map_err(|_| "media download failed".to_owned())
+}
+
+fn image_fallback(host: &str, port: u16) -> Option<SocketAddr> {
+    if host.eq_ignore_ascii_case(IMAGE_HOST) {
+        Some(SocketAddr::new(IMAGE_FALLBACK.into(), port))
+    } else {
+        None
+    }
 }
 
 async fn read_limited(mut response: reqwest::Response) -> Result<Vec<u8>, String> {
@@ -5374,34 +5402,76 @@ async fn telegram_file(
     mime: &str,
     bytes: &[u8],
 ) -> Result<Value, String> {
-    let part = Part::bytes(bytes.to_vec())
-        .file_name(filename.to_owned())
-        .mime_str(mime)
-        .map_err(|err| err.to_string())?;
-    let mut form = Form::new();
-    for (key, value) in fields {
-        form = form.text(key, value);
+    let mut last = String::new();
+    for attempt in 1..=2 {
+        let part = Part::bytes(bytes.to_vec())
+            .file_name(filename.to_owned())
+            .mime_str(mime)
+            .map_err(|err| err.to_string())?;
+        let mut form = Form::new();
+        for (key, value) in &fields {
+            form = form.text(key.clone(), value.clone());
+        }
+        form = form.part(field.to_owned(), part);
+        let url = format!("https://api.telegram.org/bot{token}/{method}");
+        beat();
+        let mut request = std::pin::pin!(http
+            .post(url)
+            .multipart(form)
+            .timeout(Duration::from_secs(TELEGRAM_FILE_SECS))
+            .send());
+        let sent = loop {
+            tokio::select! {
+                result = request.as_mut() => break result.map_err(http_failure),
+                _ = tokio::time::sleep(Duration::from_secs(30)) => beat(),
+            }
+        };
+        let response = match sent {
+            Ok(response) => response,
+            Err(err) if attempt == 1 && telegram_send_again(&err) => {
+                eprintln!("bridge: telegram {method} failed, retrying: {err}");
+                last = err;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        let status = response.status();
+        let payload: Value = match response.json().await {
+            Ok(payload) => payload,
+            Err(err) => {
+                let err = http_failure(err);
+                if attempt == 1 && telegram_send_again(&err) {
+                    eprintln!("bridge: telegram {method} failed, retrying: {err}");
+                    last = err;
+                    continue;
+                }
+                return Err(err);
+            }
+        };
+        if !status.is_success() || payload.get("ok").and_then(Value::as_bool) != Some(true) {
+            let description = payload
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("request failed");
+            return Err(format!(
+                "telegram {method} returned {status}: {description}"
+            ));
+        }
+        return Ok(payload);
     }
-    form = form.part(field.to_owned(), part);
-    let url = format!("https://api.telegram.org/bot{token}/{method}");
-    let response = http
-        .post(url)
-        .multipart(form)
-        .send()
-        .await
-        .map_err(http_failure)?;
-    let status = response.status();
-    let payload: Value = response.json().await.map_err(http_failure)?;
-    if !status.is_success() || payload.get("ok").and_then(Value::as_bool) != Some(true) {
-        let description = payload
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or("request failed");
-        return Err(format!(
-            "telegram {method} returned {status}: {description}"
-        ));
-    }
-    Ok(payload)
+    Err(last)
+}
+
+fn telegram_send_again(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("forcibly closed")
+        || lower.contains("connection reset")
+        || lower.contains("broken pipe")
+        || lower.contains("10054")
+}
+
+fn telegram_connect_again(err: &str) -> bool {
+    err.to_ascii_lowercase().contains("(connect)")
 }
 
 async fn telegram(http: &Http, token: &str, method: &str, body: Value) -> Result<Value, String> {
@@ -6142,7 +6212,22 @@ mod tests {
         assert!(!photo_download_again("media is larger than 20 MB"));
         assert!(!photo_download_again("media url is not https"));
         assert!(!photo_download_again("media host has no IPv4 address"));
+        assert!(telegram_send_again(
+            "connection error: An existing connection was forcibly closed by the remote host. (os error 10054)"
+        ));
+        assert!(!telegram_send_again(
+            "telegram sendAnimation returned 400: Bad Request"
+        ));
+        assert!(telegram_connect_again(
+            "client error (Connect): operation timed out"
+        ));
+        assert!(!telegram_connect_again("operation timed out"));
         assert_eq!(PHOTO_DOWNLOAD_TRIES, 3);
+        let fallback = image_fallback("i.oneme.ru", 443).unwrap();
+        assert_eq!(fallback.ip().to_string(), "155.212.205.252");
+        assert_eq!(fallback.port(), 443);
+        assert!(image_fallback("I.ONEME.RU", 8443).is_some());
+        assert!(image_fallback("api.oneme.ru", 443).is_none());
         let url = "https://i.oneme.ru/i?r=photo".to_owned();
         assert_eq!(photo_fallback_body("", &[url.clone()]), url);
         assert_eq!(

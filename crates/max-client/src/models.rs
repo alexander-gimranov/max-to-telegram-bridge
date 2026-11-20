@@ -199,45 +199,6 @@ pub fn display_names(names: &[Name]) -> String {
     String::new()
 }
 
-pub fn web_user_agent() -> Value {
-    json!({
-        "deviceType": "WEB",
-        "locale": "ru",
-        "deviceLocale": "ru",
-        "osVersion": "Linux",
-        "deviceName": "Chrome",
-        "headerUserAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-        "appVersion": "26.8.4",
-        "screen": "1080x1920 1.0x",
-        "timezone": "Europe/Moscow"
-    })
-}
-
-pub fn handshake_payload(device_id: &str, desktop: bool) -> Value {
-    if desktop {
-        return json!({
-            "deviceId": device_id,
-            "clientSessionId": 1,
-            "userAgent": {
-                "deviceType": "DESKTOP",
-                "appVersion": "26.35.2",
-                "osVersion": "Ubuntu 26.04.1 LTS",
-                "locale": "en",
-                "deviceLocale": "en",
-                "deviceName": "ubuntu",
-                "screen": "2.0x",
-                "timezone": "Etc/UTC",
-                "msiProductCode": "",
-                "buildNumber": 80824
-            }
-        });
-    }
-    json!({
-        "deviceId": device_id,
-        "userAgent": web_user_agent(),
-    })
-}
-
 pub fn mobile_user_agent() -> Value {
     json!({
         "deviceType": "ANDROID",
