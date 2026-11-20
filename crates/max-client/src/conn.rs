@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -34,6 +35,8 @@ use crate::voice_tcp::VoiceLink;
 const QUIET_FOR: Duration = Duration::from_secs(60);
 const CMD_WAIT: Duration = Duration::from_secs(90);
 const AUTH_HOST: &str = "api2.oneme.ru";
+// Direct address of the MAX API. Dialed only after the DNS name cannot be reached.
+const API_FALLBACK: Ipv4Addr = Ipv4Addr::new(155, 212, 204, 150);
 static BEAT: AtomicU64 = AtomicU64::new(0);
 static MAX_BEAT: AtomicU64 = AtomicU64::new(0);
 
@@ -456,9 +459,7 @@ pub struct PendingAuth {
 
 impl PendingAuth {
     pub async fn connect(device_id: &str) -> Result<Self> {
-        let addr = lookup_v4(AUTH_HOST, 443).await?;
-        let tcp = TcpStream::connect(addr).await?;
-        tcp.set_nodelay(true)?;
+        let tcp = dial_api(AUTH_HOST).await?;
         let connector = TlsConnector::from(Arc::new(tls_config()));
         let name = ServerName::try_from(AUTH_HOST)
             .map_err(|err| Error::Protocol(err.to_string()))?
@@ -1884,11 +1885,7 @@ async fn roundtrip(
 }
 
 async fn connect() -> Result<Link> {
-    let addr = lookup_v4(AUTH_HOST, 443).await?;
-    let tcp = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr))
-        .await
-        .map_err(|_| Error::Protocol(format!("MAX connect to {addr} timed out")))??;
-    tcp.set_nodelay(true)?;
+    let tcp = dial_api(AUTH_HOST).await?;
     let connector = TlsConnector::from(Arc::new(tls_config()));
     let name = ServerName::try_from(AUTH_HOST)
         .map_err(|err| Error::Protocol(err.to_string()))?
@@ -1931,12 +1928,65 @@ pub(crate) fn tls_config() -> ClientConfig {
 const RUSSIAN_TRUSTED_SUB_CA: &[u8] = include_bytes!("../certs/russian_trusted_sub_ca.der");
 const RUSSIAN_TRUSTED_ROOT_CA: &[u8] = include_bytes!("../certs/russian_trusted_root_ca.der");
 
-pub async fn lookup_v4(host: &str, port: u16) -> Result<std::net::SocketAddr> {
+pub async fn lookup_v4(host: &str, port: u16) -> Result<SocketAddr> {
     let mut found = lookup_v4_all(host, port).await?;
     Ok(found.remove(0))
 }
 
-pub async fn lookup_v4_all(host: &str, port: u16) -> Result<Vec<std::net::SocketAddr>> {
+pub(crate) async fn dial_api(host: &str) -> Result<TcpStream> {
+    const PORT: u16 = 443;
+    let fallback = SocketAddr::new(IpAddr::V4(API_FALLBACK), PORT);
+    let resolved = match lookup_v4_all(host, PORT).await {
+        Ok(addrs) => addrs,
+        Err(err) => return dial_fallback(host, fallback, err).await,
+    };
+    let mut failure = None;
+    for addr in &resolved {
+        match dial_addr(*addr).await {
+            Ok(tcp) => return Ok(tcp),
+            Err(err) => {
+                if failure.is_none() {
+                    failure = Some(err);
+                }
+            }
+        }
+    }
+    let err = failure.unwrap_or_else(|| Error::Protocol(format!("MAX connect to {host} failed")));
+    if fallback_after(&resolved, fallback).is_none() {
+        return Err(err);
+    }
+    dial_fallback(host, fallback, err).await
+}
+
+fn fallback_after(resolved: &[SocketAddr], fallback: SocketAddr) -> Option<SocketAddr> {
+    if resolved.iter().any(|addr| addr.ip() == fallback.ip()) {
+        None
+    } else {
+        Some(fallback)
+    }
+}
+
+async fn dial_fallback(host: &str, fallback: SocketAddr, err: Error) -> Result<TcpStream> {
+    match dial_addr(fallback).await {
+        Ok(tcp) => {
+            eprintln!("bridge: {host} is unreachable, using {fallback}");
+            Ok(tcp)
+        }
+        Err(fallback_err) => Err(Error::Protocol(format!(
+            "{err}; fallback {fallback} failed: {fallback_err}"
+        ))),
+    }
+}
+
+async fn dial_addr(addr: SocketAddr) -> Result<TcpStream> {
+    let tcp = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr))
+        .await
+        .map_err(|_| Error::Protocol(format!("MAX connect to {addr} timed out")))??;
+    tcp.set_nodelay(true)?;
+    Ok(tcp)
+}
+
+pub async fn lookup_v4_all(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     let addrs = tokio::time::timeout(
         Duration::from_secs(5),
         tokio::net::lookup_host((host, port)),
@@ -1961,6 +2011,15 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn fallback_is_used_only_when_the_name_has_no_route() {
+        let fallback = SocketAddr::new(IpAddr::V4(API_FALLBACK), 443);
+        let other: SocketAddr = "155.212.204.90:443".parse().unwrap();
+        assert_eq!(fallback_after(&[], fallback), Some(fallback));
+        assert_eq!(fallback_after(&[other], fallback), Some(fallback));
+        assert!(fallback_after(&[fallback], fallback).is_none());
+    }
 
     #[test]
     fn tls_config_trusts_the_oneme_issuer() {

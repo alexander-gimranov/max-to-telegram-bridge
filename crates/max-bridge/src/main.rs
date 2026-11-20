@@ -22,6 +22,7 @@ use reqwest::multipart::{Form, Part};
 use reqwest::Client as Http;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use time::{OffsetDateTime, UtcOffset};
 use tokio::sync::{mpsc, watch};
 
 const TELEGRAM_HOST: &str = "api.telegram.org";
@@ -37,6 +38,7 @@ static TELEGRAM_ABORT: Mutex<Option<tokio::task::AbortHandle>> = Mutex::new(None
 static MAX_ABORT: Mutex<Option<tokio::task::AbortHandle>> = Mutex::new(None);
 const MAX_MEDIA_BYTES: usize = 20 * 1024 * 1024;
 const PHOTO_DOWNLOAD_TRIES: u32 = 3;
+const SENDER_GAP: &str = "\u{2003}\u{2003}";
 const STALL_AFTER_SECS: u64 = 180;
 const WORKER_STALL_SECS: u64 = 90;
 const ERROR_ALERT: u64 = 100;
@@ -1504,6 +1506,69 @@ fn header_prefix(
     String::new()
 }
 
+fn message_stamp(unix_ms: i64) -> String {
+    stamped_at(unix_ms, local_offset_secs(unix_ms))
+}
+
+fn stamped_at(unix_ms: i64, offset_secs: i32) -> String {
+    let Some(secs) = unix_seconds(unix_ms) else {
+        return String::new();
+    };
+    let local = secs.saturating_add(i64::from(offset_secs));
+    if local < 0 {
+        return String::new();
+    }
+    let days = local.div_euclid(86_400);
+    let clock = local.rem_euclid(86_400) as u64;
+    let hour = clock / 3_600;
+    let min = (clock % 3_600) / 60;
+    let sec = clock % 60;
+    let (year, month, day) = civil_date(days);
+    format!(
+        "{day:02}.{month:02}.{:02} {hour:02}:{min:02}:{sec:02}",
+        year.rem_euclid(100)
+    )
+}
+
+fn unix_seconds(unix_ms: i64) -> Option<i64> {
+    if unix_ms >= 1_000_000_000_000 {
+        Some(unix_ms / 1000)
+    } else if unix_ms >= 1_000_000_000 {
+        Some(unix_ms)
+    } else {
+        None
+    }
+}
+
+fn local_offset_secs(unix_ms: i64) -> i32 {
+    let Some(secs) = unix_seconds(unix_ms) else {
+        return 0;
+    };
+    let Ok(utc) = OffsetDateTime::from_unix_timestamp(secs) else {
+        return 0;
+    };
+    UtcOffset::local_offset_at(utc)
+        .map(|offset| offset.whole_seconds())
+        .unwrap_or(0)
+}
+
+fn stamp_line(name: &str, stamp: &str) -> String {
+    let name = name.trim();
+    let stamp = stamp.trim();
+    if name.is_empty() || stamp.is_empty() {
+        return name.to_owned();
+    }
+    format!("{name}{SENDER_GAP}{stamp}")
+}
+
+fn history_header(name: &str, stamp: &str) -> String {
+    let line = stamp_line(name, stamp);
+    if !line.is_empty() {
+        return line;
+    }
+    stamp.trim().to_owned()
+}
+
 async fn lookup_name(client: &Client, user_id: Option<i64>) -> String {
     let Some(user_id) = user_id else {
         return String::new();
@@ -1544,7 +1609,13 @@ async fn forward_max(
     } else {
         forward_author(client, message).await
     };
-    let bold_prefix = header_prefix(forward_name.as_deref(), own, face.group, chat_id, &sender);
+    let stamp = message_stamp(message.time);
+    let name = header_prefix(forward_name.as_deref(), own, face.group, chat_id, &sender);
+    let bold_prefix = if history {
+        history_header(&name, &stamp)
+    } else {
+        stamp_line(&name, &stamp)
+    };
     let title = if chat_id == 0 {
         text::FAVORITES.to_owned()
     } else {
@@ -1571,12 +1642,13 @@ async fn forward_max(
                 &sender,
                 &title,
                 &message.text,
+                &stamp,
             )
         };
         let feed_caption = if !bold_prefix.is_empty() {
             clip_caption(&join_name(&bold_prefix, &message.text))
         } else {
-            media_caption(Mode::Chat, false, &sender, &title, &message.text)
+            media_caption(Mode::Chat, false, &sender, &title, &message.text, &stamp)
         };
         let mut files = Vec::new();
         let mut deferred = None::<String>;
@@ -1704,14 +1776,15 @@ async fn forward_max(
     };
     match config.mode {
         Mode::Chat => {
+            let heading = chat_heading(&sender, &title);
+            if heading == "MAX" {
+                eprintln!("bridge: contact name is missing for chat {chat_id}");
+            }
             let who = if !bold_prefix.is_empty() {
                 bold_prefix.clone()
             } else {
-                chat_heading(&sender, &title)
+                stamp_line(&heading, &stamp)
             };
-            if who == "MAX" {
-                eprintln!("bridge: contact name is missing for chat {chat_id}");
-            }
             let text = clip(&format!("{who}\n\n{body}"), 4000);
             for user_id in &config.allowed {
                 send_feed(
@@ -1771,7 +1844,7 @@ async fn forward_max(
                     let fallback = if !bold_prefix.is_empty() {
                         clip(&join_name(&bold_prefix, &body), 4000)
                     } else {
-                        let who = chat_heading(&sender, &title);
+                        let who = stamp_line(&chat_heading(&sender, &title), &stamp);
                         clip(&format!("{who}\n\n{body}"), 4000)
                     };
                     send_feed(
@@ -1818,7 +1891,13 @@ async fn deliver_specials(
             record_untyped(chat_id, message.id, raw);
         }
     }
-    let head = special_head(config.mode, bold_prefix, sender, title);
+    let head = special_head(
+        config.mode,
+        bold_prefix,
+        sender,
+        title,
+        &message_stamp(message.time),
+    );
     if let Some(rich) = special_rich(&head, lead, &message.specials) {
         let plain = clip(&special_plain(&head, lead, &message.specials), 4000);
         relay_text(
@@ -1958,12 +2037,12 @@ fn chat_heading_missing(prefix: &str) -> bool {
     prefix == "MAX"
 }
 
-fn special_head(mode: Mode, bold_prefix: &str, sender: &str, title: &str) -> String {
+fn special_head(mode: Mode, bold_prefix: &str, sender: &str, title: &str, stamp: &str) -> String {
     if !bold_prefix.is_empty() {
         return bold_prefix.to_owned();
     }
     if mode == Mode::Chat {
-        return chat_heading(sender, title);
+        return stamp_line(&chat_heading(sender, title), stamp);
     }
     String::new()
 }
@@ -2883,13 +2962,20 @@ fn named_rich(prefix: &str, text: &str) -> Option<Value> {
     } else {
         text.strip_prefix(&format!("{prefix}\n\n"))?
     };
-    let name = json!({"type": "bold", "text": prefix});
+    let name = json!({"type": "bold", "text": bold_name(prefix)});
+    let rest = &prefix[bold_name(prefix).len()..];
     let pad = clock_pad(if body.is_empty() {
         prefix
     } else {
         last_line(body)
     });
-    let mut parts = vec![name];
+    let mut parts = Vec::new();
+    if !bold_name(prefix).is_empty() {
+        parts.push(name);
+    }
+    if !rest.is_empty() {
+        parts.push(json!(rest));
+    }
     if !body.is_empty() {
         parts.push(json!("\n\n"));
         parts.push(json!(body));
@@ -2936,7 +3022,14 @@ fn special_rich(prefix: &str, lead: &str, specials: &[SpecialAttach]) -> Option<
     if !prefix.is_empty() || !lead.is_empty() {
         let mut parts = Vec::new();
         if !prefix.is_empty() {
-            parts.push(json!({"type": "bold", "text": prefix}));
+            let name = bold_name(prefix);
+            let rest = &prefix[name.len()..];
+            if !name.is_empty() {
+                parts.push(json!({"type": "bold", "text": name}));
+            }
+            if !rest.is_empty() {
+                parts.push(json!(rest));
+            }
         }
         if !lead.is_empty() {
             if !parts.is_empty() {
@@ -3213,6 +3306,29 @@ fn own_header(body: &str) -> String {
     }
 }
 
+fn bold_name(prefix: &str) -> &str {
+    if let Some((name, _)) = prefix.split_once(SENDER_GAP) {
+        return name;
+    }
+    if is_stamp(prefix.trim()) {
+        return "";
+    }
+    prefix
+}
+
+fn is_stamp(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() != 17 {
+        return false;
+    }
+    bytes.iter().enumerate().all(|(index, byte)| match index {
+        2 | 5 => *byte == b'.',
+        8 => *byte == b' ',
+        11 | 14 => *byte == b':',
+        _ => byte.is_ascii_digit(),
+    })
+}
+
 fn bold_prefix_entities(prefix: &str, text: &str) -> Option<Value> {
     if prefix.is_empty() {
         return None;
@@ -3220,7 +3336,7 @@ fn bold_prefix_entities(prefix: &str, text: &str) -> Option<Value> {
     if text != prefix && !text.starts_with(&format!("{prefix}\n\n")) {
         return None;
     }
-    let length = prefix.encode_utf16().count();
+    let length = bold_name(prefix).encode_utf16().count();
     if length == 0 {
         return None;
     }
@@ -3326,11 +3442,18 @@ fn photo_fallback_body(text: &str, urls: &[String]) -> String {
     lines.join("\n\n")
 }
 
-fn media_caption(mode: Mode, group: bool, sender: &str, title: &str, text: &str) -> String {
+fn media_caption(
+    mode: Mode,
+    group: bool,
+    sender: &str,
+    title: &str,
+    text: &str,
+    stamp: &str,
+) -> String {
     let body = text.trim();
     match mode {
         Mode::Chat => {
-            let who = chat_heading(sender, title);
+            let who = stamp_line(&chat_heading(sender, title), stamp);
             if body.is_empty() {
                 clip_caption(&who)
             } else {
@@ -3339,10 +3462,11 @@ fn media_caption(mode: Mode, group: bool, sender: &str, title: &str, text: &str)
         }
         Mode::Thread => {
             if group && !sender.is_empty() {
+                let who = stamp_line(sender, stamp);
                 if body.is_empty() {
-                    clip_caption(sender)
+                    clip_caption(&who)
                 } else {
-                    clip_caption(&format!("{sender}\n\n{body}"))
+                    clip_caption(&format!("{who}\n\n{body}"))
                 }
             } else {
                 clip_caption(body)
@@ -5494,6 +5618,18 @@ mod tests {
         assert_eq!(header_prefix(None, true, true, 9, "Петр"), text::YOU);
         assert_eq!(header_prefix(None, false, true, 9, "Петр"), "Петр");
         assert_eq!(header_prefix(None, false, false, 9, "Петр"), "");
+        let stamp = stamped_at(1_794_573_748_227, 3 * 3_600);
+        assert_eq!(stamp, "13.11.26 15:42:28");
+        let line = stamp_line("Маня Н", &stamp);
+        assert_eq!(line, format!("Маня Н{SENDER_GAP}{stamp}"));
+        assert_eq!(bold_name(&line), "Маня Н");
+        assert_eq!(bold_name(&stamp), "");
+        assert_eq!(stamp_line("", &stamp), "");
+        assert_eq!(stamped_at(0, 0), "");
+        assert_eq!(stamped_at(100, 0), "");
+        assert_eq!(history_header("Маня Н", &stamp), line);
+        assert_eq!(history_header("", &stamp), "13.11.26 15:42:28");
+        assert_eq!(history_header("ты", ""), "ты");
     }
 
     #[test]
@@ -5867,19 +6003,33 @@ mod tests {
     #[test]
     fn caption_keeps_the_message_text() {
         assert_eq!(
-            media_caption(Mode::Thread, false, "Маня Н", "Маня Н", ""),
+            media_caption(Mode::Thread, false, "Маня Н", "Маня Н", "", ""),
             ""
         );
         assert_eq!(
-            media_caption(Mode::Thread, true, "Маня Н", "Семья", ""),
+            media_caption(Mode::Thread, true, "Маня Н", "Семья", "", ""),
             "Маня Н"
         );
-        let chat = media_caption(Mode::Chat, false, "Маня Н", "Маня Н", "");
+        let chat = media_caption(Mode::Chat, false, "Маня Н", "Маня Н", "", "");
         assert!(!chat.contains("(no text)"));
         assert!(chat.contains("Маня Н"));
         assert_eq!(
-            media_caption(Mode::Thread, false, "Маня Н", "Маня Н", "привет"),
+            media_caption(Mode::Thread, false, "Маня Н", "Маня Н", "привет", ""),
             "привет"
+        );
+        assert_eq!(
+            media_caption(
+                Mode::Thread,
+                true,
+                "Маня Н",
+                "Семья",
+                "привет",
+                "13.11.26 15:42:28"
+            ),
+            format!(
+                "{}\n\nпривет",
+                stamp_line("Маня Н", "13.11.26 15:42:28")
+            )
         );
     }
 
@@ -6143,6 +6293,15 @@ mod tests {
         assert_eq!(
             bold_prefix_entities("Ната К", "Ната К\n\nтекст"),
             Some(json!([{"type": "bold", "offset": 0, "length": 6}]))
+        );
+        let stamped = stamp_line("Ната К", "13.11.26 15:42:28");
+        assert_eq!(
+            bold_prefix_entities(&stamped, &format!("{stamped}\n\nтекст")),
+            Some(json!([{"type": "bold", "offset": 0, "length": 6}]))
+        );
+        assert_eq!(
+            bold_prefix_entities("13.11.26 15:42:28", "13.11.26 15:42:28"),
+            None
         );
         assert_eq!(bold_prefix_entities("ты", "привет"), None);
         assert_eq!(named_rich("", "привет"), None);

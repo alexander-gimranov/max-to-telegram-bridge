@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-use crate::conn::{lookup_v4, tls_config};
+use crate::conn::{dial_api, tls_config};
 use crate::error::{Error, Result};
 use crate::models::{mobile_handshake_payload, Attach, VideoTicket, VoiceTicket};
 use crate::profile::Session;
@@ -146,9 +146,7 @@ impl VoiceLink {
 async fn connect_voice(
     session: &Session,
 ) -> Result<(tokio_rustls::client::TlsStream<TcpStream>, u16)> {
-    let addr = lookup_v4(HOST, 443).await?;
-    let tcp = TcpStream::connect(addr).await?;
-    tcp.set_nodelay(true)?;
+    let tcp = dial_api(HOST).await?;
     let connector = TlsConnector::from(Arc::new(tls_config()));
     let name = ServerName::try_from(HOST)
         .map_err(|err| Error::Protocol(err.to_string()))?
